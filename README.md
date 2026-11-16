@@ -51,8 +51,8 @@ uses `try/except`. PyRust found the one hot function, compiled it, and left ever
 
 - **One-letter migration.** Rename `app.py` to `app.pyr`, or just point `pyrust run` at the `.py` file.
 - **Never breaks a program.** Anything PyRust can't compile runs on CPython: every library, every language feature.
-- **Same answers as Python.** Integer overflow, division by zero and `math` errors are detected in native code,
-  and the call is handed back to Python for the exact result or exception.
+- **Same answers as Python.** Native code reproduces CPython's output, formatting and exceptions; anything it
+  cannot reproduce exactly (from 64-bit overflow to shared mutable objects) is handed back to CPython.
 - **No annotations required.** Types are inferred from how you use your values. Hints like `n: int` help but are optional.
 - **Tells you what it did.** `pyrust check` lists which functions went native and why the others didn't.
 - **Zero Python dependencies.** Rust is only needed to compile; without it, programs still run on CPython.
@@ -100,7 +100,11 @@ The first run of a program compiles it (a few seconds). Later runs reuse the cac
 `pyrust run` tries three tiers in order and uses the first that works.
 
 1. **Native.** PyRust infers a concrete type for every value, translates the whole program to Rust, and builds one
-   binary. Values that change type at runtime become a small tagged union instead of failing.
+   binary. Values that change type at runtime (including a variable that is an `int` on one path and a `float` on
+   another) become a small tagged union instead of failing. Rust stores lists, dicts and objects by value where
+   Python shares them, so an alias analysis checks that this sharing is never observable: modifying a list passed
+   to a function, a row of a grid or an object inside a list works natively; a program where two names could see
+   one object change runs on CPython instead.
 2. **Hybrid.** When the program as a whole can't be translated, PyRust looks for top-level functions that are *pure*:
    no I/O, no global state, calling only `math`, pure builtins and each other, with `int`/`float`/`bool` arguments
    and results, and containing a loop or recursion (anything smaller isn't worth the trip into native code).
@@ -112,9 +116,14 @@ The first run of a program compiles it (a few seconds). Later runs reuse the cac
 
 A native function is only ever a fast path in front of your original function:
 
-- Every call checks the argument types. A call that doesn't match the compiled signature goes to the original.
+- Every call checks the argument types. A call that doesn't match a compiled signature goes to the original.
+  When call sites use different signatures (say `int` and `float`), each gets its own compiled version.
+- Every call also checks that the globals, builtins and `math` attributes the native code depends on are still the
+  objects it was compiled against. If your program rebinds one (`from settings import *`, `globals()[...] = ...`,
+  monkeypatching), or calls the function before something it uses is defined, the original runs and behaves
+  exactly as Python does, `NameError` included.
 - If native code hits something Python handles differently (an integer leaving the 64-bit range, a zero divisor,
-  a `math` domain error, a bad index), it reports failure and the original Python function runs.
+  a `math` domain error, a bad index, deep recursion), it reports failure and the original Python function runs.
 - Only pure functions are compiled, so running one a second time has no side effects.
 
 ```python
@@ -183,15 +192,22 @@ the walrus operator, `raise`, `del`, slicing, tuples, `None` checks, chained com
 <details>
 <summary><b>Builtins and methods</b></summary>
 
-**Builtins:** `len` `str` `int` `float` `bool` `abs` `sum` `min` `max` `sorted` `list` `set` `dict` `enumerate`
-`zip` `range` `input` `print` `round` `divmod` `all` `any` `reversed` `ord` `chr` `hex` `oct` `bin` `open`
+**Builtins:** `len` `str` `repr` `int` `float` `bool` `abs` `sum` `min` `max` `sorted` (with `reverse=`) `list`
+`set` `dict` `enumerate` `zip` `range` `input` `print` (with `sep`, `end`, `file=sys.stderr`, `flush`) `round`
+`divmod` `all` `any` `reversed` `ord` `chr` `hex` `oct` `bin` `open`
 
 **Lists:** `append` `pop` `extend` `insert` `remove` `index` `count` `copy` `sort` `reverse` `clear`
 
 **Dicts:** `get` `keys` `values` `items` `pop` `setdefault` `update` `copy` `clear`
 
-**Strings:** `upper` `lower` `strip` `lstrip` `rstrip` `split` `splitlines` `replace` `join` `startswith`
-`endswith` `find` `count` `removeprefix` `removesuffix` `capitalize` `isdigit` `isalpha` `isspace`
+**Sets:** `add` `remove` `discard` `clear` `copy`, `|` `&` `-` `^`, `in`, `len`, `sorted()`
+
+**Strings:** `upper` `lower` `strip` `lstrip` `rstrip` (with or without characters) `split` (with `maxsplit`)
+`splitlines` `replace` (with `count`) `join` `startswith` `endswith` `find` `rfind` `index` `count`
+`removeprefix` `removesuffix` `capitalize` `isdigit` `isdecimal` `isnumeric` `isalpha` `isalnum` `isspace`
+
+Formatting (f-strings, `str.format`, `%`) follows Python's format-spec mini-language exactly, and printing a value
+always shows its Python `str()`/`repr()`, for nested containers and `@dataclass` objects too.
 
 **Files:** `read` `readlines` `write` `close`, iteration, `with open(...) as f`
 
@@ -203,12 +219,12 @@ the walrus operator, `raise`, `del`, slicing, tuples, `None` checks, chained com
 | Module | Supported |
 |---|---|
 | `math` | `sqrt` `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `exp` `log` `log2` `log10` `pow` `hypot` `fabs` `floor` `ceil`, `pi` `e` `tau` |
-| `random` | `seed` `random` `randint` `uniform` `choice` `shuffle` (deterministic, but a different stream from CPython's) |
+| `random` | `seed` `random` `randint` `uniform` `choice` `shuffle` (CPython's Mersenne Twister: the same numbers for the same seed) |
 | `json` | `dumps` `loads` |
 | `sys` | `argv` `exit` |
 | `os` | `getenv` `getcwd` `listdir` `makedirs` `mkdir` `remove` |
 | `time` | `time` `perf_counter` `sleep` |
-| `statistics` | `mean` `median` `median_low` `median_high` `mode` `variance` `pvariance` `stdev` `pstdev` `harmonic_mean` |
+| `statistics` | `mean` (int or float data), `variance` `pvariance` (int data), `median` `median_low` `median_high` `mode`, all exact like CPython's |
 | `platform`, `gc` | common queries |
 
 Multi-file projects compile into one binary: `import helper` and `from helper import thing` work across files.
@@ -221,7 +237,12 @@ Multi-file projects compile into one binary: `import helper` and `from helper im
 `try/except`, `with` other than `with open(...)`, `match`, `async`, generators and generator expressions, `lambda`,
 closures and nested functions, decorators other than `@dataclass`, `global`/`nonlocal`, `super()`, `**kwargs` and
 keyword-only arguments, `map`/`filter`, `isinstance`, special methods other than `__init__`, `sorted(key=...)`,
-integers beyond 64 bits, and any import not listed above.
+user-defined exception classes, and any import not listed above.
+
+Some programs are refused because native code could not reproduce what CPython observably does: iterating over a
+set (CPython's set order), printing plain objects (their repr shows a memory address), comparing plain objects
+(identity), dict views kept as values, a variable read where it may be unassigned, and two names sharing a list,
+dict or object that is then modified (`b = a; a.append(1)`, `grid = [[0] * 3] * 3`, mutable default arguments).
 
 </details>
 
@@ -229,9 +250,9 @@ integers beyond 64 bits, and any import not listed above.
 
 - **Your time goes to libraries, files or the network.** NumPy, pandas, requests and database drivers are already
   compiled or are waiting on something external.
-- **Your hot code is a tiny function called millions of times from Python.** Each native call costs about one
-  microsecond of bridging. PyRust only compiles functions that loop or recurse, and they gain the most when
-  each call does real work.
+- **Your hot code is a tiny function called millions of times from Python.** A native call costs roughly 100 ns
+  (about 30 ns more than an empty Python call, plus ~10 ns per global the guard checks). PyRust only compiles
+  functions that loop or recurse; a function whose loop runs only a handful of times barely breaks even.
 - **Your hot functions take lists, strings or objects.** The hybrid tier currently compiles functions with
   `int`/`float`/`bool` arguments and results only.
 - **Your script finishes in milliseconds.** There is nothing to speed up.
@@ -239,16 +260,21 @@ integers beyond 64 bits, and any import not listed above.
 
 ## Status and known limits
 
-PyRust is **alpha**. The hybrid and Python tiers are safe by construction, because Python itself is the fallback.
-The native tier has no fallback at runtime: its output matches CPython on the bundled examples and tests, but it has
-not been checked against a large body of real programs yet.
+PyRust is **alpha**. The goal is that every program prints exactly what `python` prints and exits with the same
+status: either native code reproduces CPython, or PyRust refuses to compile that part and CPython runs it. A
+differential test suite (`tests/differential`, a few hundred programs) checks this on CPython 3.11, 3.12, 3.13 and
+3.14: stdout, exit status, the final traceback line, and which tier ran. It is still young software; compare
+against `python` for anything critical, and please report any difference.
 
-- Native-tier integers are 64-bit. Overflow stops the program with an error; it never produces a wrong number.
-- Native-tier `random` is deterministic but does not reproduce CPython's sequence for a given seed.
+- Native-tier integers are 64-bit. When a value would leave that range, a program that has not yet read input or
+  written files is re-run on CPython (the output already printed is not repeated), so you get Python's exact
+  result. Otherwise it stops with an `OverflowError` explaining the limit. It never prints a wrong number.
+- Native recursion follows CPython's limit (1000 frames) and raises `RecursionError` like CPython. In the hybrid
+  tier, recursion deeper than 100 native frames continues in Python; a native call made when your Python stack is
+  already within 100 frames of the limit can succeed where CPython would raise `RecursionError`.
+- Uncaught exceptions print a short traceback with the same final line as CPython; the frames themselves differ.
 - On Windows, native binaries write `\n` line endings where CPython writes `\r\n` to redirected output.
-- A native function that recurses tens of thousands of levels deep crashes instead of raising `RecursionError`.
 - The hybrid tier accelerates the entry file only, not the modules it imports.
-- `a = b = []` copies instead of aliasing in the native tier.
 
 ## How PyRust compares
 
@@ -283,26 +309,31 @@ Run `pyrust check`. It names each function that stayed on Python and the reason.
 function with number arguments is usually enough.
 
 **Can I trust the output?**
-In the hybrid tier, yes, by design: Python is the fallback for anything unusual. In the native tier, treat it as
-alpha and compare against `python` for anything that matters.
+That is the design goal of every tier, and the differential suite enforces it on four CPython versions. The hybrid
+tier is the most conservative (Python re-runs any call native code cannot finish exactly). The native tier refuses
+programs it cannot prove it reproduces. It is alpha software, so for anything critical compare with `python`.
 
 ## Roadmap
 
 - Lists and strings as arguments to native functions
 - Native functions in imported modules, not only the entry file
 - More of the language in the native tier: `try/except`, closures, `isinstance`, `sorted(key=...)`
-- A differential test suite that runs a large corpus through both CPython and the native tier
+- Shared (reference-counted) lists and objects natively, so programs with aliasing need not fall back
 
 ## Contributing
 
 ```console
 $ pip install -e ".[dev]"
-$ pytest
+$ pytest -n auto
 ```
 
-The tests that build native code are skipped automatically when Rust isn't installed. The transpiler lives in
-[`pyrust/`](pyrust): `inference.py` works out types, `codegen.py` writes Rust, `hybrid.py` picks and builds native
-functions, and `runtime_template.py` is the Rust support library that gives native code Python's semantics.
+`tests/test_differential.py` runs every program under `tests/differential/` with `python` and with `pyrust run`
+and requires identical behaviour; a new feature or bug fix should come with a program there. The tests that build
+native code are skipped automatically when Rust isn't installed. The transpiler lives in
+[`pyrust/`](pyrust): `inference.py` works out types, `aliasing.py` proves that copying lists/dicts/objects is
+unobservable, `definite.py` checks variables are assigned before use, `codegen.py` writes Rust, `hybrid.py` picks
+and builds native functions, and `runtime_template.py` is the Rust support library that gives native code Python's
+semantics.
 To regenerate the graphics in this README, run `python assets/generate.py`.
 
 ## License
