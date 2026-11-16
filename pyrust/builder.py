@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 import hashlib
 import os
@@ -13,15 +14,26 @@ from pyrust.codegen import generate_rust_module
 from pyrust.errors import PyRustError
 from pyrust.inference import _TypeInferer, _positional_params, infer_module
 from pyrust.ownership import analyze_ownership
-from pyrust.parser import IGNORED_IMPORTS, load_project
+from pyrust.parser import IGNORED_IMPORTS, PyRustSyntaxError, find_entry, load_project, project_files
 from pyrust.runtime_template import RUNTIME_RS
 from pyrust.types import FuncType, unify_types
 
+# Cargo refuses these as binary target names (they collide with folders in
+# target/), and Windows cannot create files with the device names.
+_RESERVED_BIN_NAMES = {"build", "deps", "examples", "incremental", "con", "prn", "aux", "nul"} | {
+    f"{dev}{i}" for dev in ("com", "lpt") for i in range(1, 10)
+}
+
 
 def _sanitize_crate_name(name: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", name.lower()).strip("_")
+    """A Cargo package/binary name for a script or folder name (Unicode letters are kept)."""
+    cleaned = "".join(
+        c if c == "_" or (c.isalnum() and f"a{c}".isidentifier()) else "_" for c in name.lower()
+    ).strip("_")
     if not cleaned or cleaned[0].isdigit():
         cleaned = f"pyrust_{cleaned or 'app'}"
+    if cleaned in _RESERVED_BIN_NAMES:
+        cleaned = f"{cleaned}_app"
     return cleaned
 
 
@@ -39,26 +51,50 @@ overflow-checks = true
 """
 
 
-from pyrust.plancache import load_plan, save_plan, toolchain_salt as _toolchain_salt  # noqa: E402
+from pyrust.plancache import (  # noqa: E402
+    cache_dir,
+    find_tool,
+    load_plan,
+    save_plan,
+    toolchain_salt as _toolchain_salt,
+)
+
+# Marks a folder as a crate PyRust generated, so `-o` may overwrite it.
+CRATE_MARKER = ".pyrust-crate"
 
 
-def compute_project_hash(target_path: Path) -> str:
-    modules = load_project(target_path)
+def _crate_name_for(target_path: Path) -> str:
+    target_path = Path(target_path)
+    return _sanitize_crate_name(target_path.stem if target_path.is_file() else target_path.name)
+
+
+def _project_hash(modules: list) -> str:
     digest = hashlib.sha256()
     # Generated code depends on the transpiler itself: never reuse a binary
-    # built by a different PyRust.
+    # built by a different PyRust (or Rust toolchain).
     digest.update(_toolchain_salt().encode("utf-8"))
     for mod in modules:
         digest.update(mod.name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(mod.source.encode("utf-8"))
+        digest.update(mod.source.encode("utf-8", "surrogatepass"))
         digest.update(b"\0")
     return digest.hexdigest()[:16]
 
 
-# Third-party/C modules PyRust cannot transpile: importing any of these is a
-# hard error at transpile time (honest instead of broken Rust).
+# Standard-library modules with a native implementation. Any other import that
+# is not one of the project's own modules keeps the program on CPython.
 SUPPORTED_STDLIB_MODULES = {"math", "random", "json", "sys", "os", "time", "platform", "statistics", "gc"}
+
+
+def compute_project_hash(target_path: Path) -> str:
+    return _project_hash(load_project(target_path, SUPPORTED_STDLIB_MODULES))
+
+
+def default_crate_dir(target_path: Path) -> Path:
+    """The cache folder holding the crate for `target_path` as it is now."""
+    target_path = Path(target_path).resolve()
+    base_dir = target_path.parent if target_path.is_file() else target_path
+    return Path(cache_dir(str(base_dir))) / f"{_crate_name_for(target_path)}_{compute_project_hash(target_path)}"
 
 
 def _check_imports_resolvable(modules: list) -> None:
@@ -67,7 +103,6 @@ def _check_imports_resolvable(modules: list) -> None:
         for imp in mod.imports:
             top = imp.split(".")[0]
             if top not in known and top not in {"main"}:
-                from_imports = getattr(mod, "from_imports", {})
                 raise PyRustError(
                     f"import '{imp}' has no native Rust equivalent, so it runs on CPython",
                     filename=str(mod.path) if mod.path else mod.name,
@@ -81,25 +116,89 @@ def _check_imports_resolvable(modules: list) -> None:
                 )
 
 
+def _is_simple_constant(node: ast.expr) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (int, float, bool, str))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float))
+    return False
+
+
+def _check_import_time_code(modules: list) -> None:
+    """Imported modules only contribute definitions to the native crate.
+
+    Code a non-entry module runs at import time (a print, a loop, a computed
+    global) would silently vanish, so such programs stay on CPython.
+    """
+    from pyrust.parser import _is_docstring_stmt, _is_main_guard
+
+    for mod in modules[1:]:
+        for idx, stmt in enumerate(mod.tree.body):
+            if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef, ast.Pass)):
+                continue
+            if idx == 0 and _is_docstring_stmt(stmt):
+                continue
+            if isinstance(stmt, ast.If) and _is_main_guard(stmt):
+                continue  # does not run on import
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and _is_simple_constant(stmt.value)
+            ) or (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.value is not None
+                and _is_simple_constant(stmt.value)
+            ):
+                continue
+            raise PyRustError(
+                f"module '{mod.name}' runs code when imported (line {stmt.lineno}), "
+                "which only the CPython tier reproduces",
+                filename=str(mod.path) if mod.path else mod.name,
+            )
+
+
+def _prepare_output_dir(output_dir: Path) -> Path:
+    """Validate a user-chosen `-o` folder: never clobber a crate PyRust did not write."""
+    output_dir = Path(output_dir).resolve()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise PyRustError(f"Output path {output_dir} exists and is not a directory")
+    if output_dir.is_dir() and not (output_dir / CRATE_MARKER).exists():
+        existing = [n for n in ("Cargo.toml", "src/main.rs") if (output_dir / n).exists()]
+        if existing:
+            raise PyRustError(
+                f"{output_dir} already contains {' and '.join(existing)} that PyRust did not generate; "
+                "refusing to overwrite it. Choose a new or empty directory."
+            )
+    return output_dir
+
+
+def _write_crate(output_dir: Path, crate_name: str, files: dict[str, str]) -> None:
+    try:
+        (output_dir / "src").mkdir(parents=True, exist_ok=True)
+        (output_dir / CRATE_MARKER).write_text("Generated by PyRust; safe to overwrite.\n", encoding="utf-8")
+        (output_dir / "Cargo.toml").write_text(_cargo_toml_template(crate_name), encoding="utf-8")
+        (output_dir / "src" / "pyrust_rt.rs").write_text(RUNTIME_RS, encoding="utf-8")
+        for name, text in files.items():
+            (output_dir / "src" / name).write_text(text, encoding="utf-8")
+    except OSError as exc:
+        raise PyRustError(f"Cannot write the Rust project to {output_dir}: {exc.strerror or exc}") from exc
+
+
 def emit_cargo_project(target_path: Path, output_dir: Path | None = None) -> Path:
     """Transpile a single `.pyr`/`.py` script or directory of modules into a standalone Cargo project."""
     target_path = Path(target_path).resolve()
-    modules = load_project(target_path)
+    modules = load_project(target_path, SUPPORTED_STDLIB_MODULES)
     _check_imports_resolvable(modules)
-    crate_name = _sanitize_crate_name(target_path.stem if target_path.is_file() else target_path.name)
+    _check_import_time_code(modules)
+    crate_name = _crate_name_for(target_path)
 
     if output_dir is None:
         base_dir = target_path.parent if target_path.is_file() else target_path
-        project_hash = compute_project_hash(target_path)
-        output_dir = base_dir / ".pyrust_cache" / f"{crate_name}_{project_hash}"
+        output_dir = Path(cache_dir(str(base_dir))) / f"{crate_name}_{_project_hash(modules)}"
     else:
-        output_dir = Path(output_dir).resolve()
-
-    src_dir = output_dir / "src"
-    src_dir.mkdir(parents=True, exist_ok=True)
-
-    (output_dir / "Cargo.toml").write_text(_cargo_toml_template(crate_name), encoding="utf-8")
-    (src_dir / "pyrust_rt.rs").write_text(RUNTIME_RS, encoding="utf-8")
+        output_dir = _prepare_output_dir(output_dir)
 
     # Infer all modules and propagate cross-module call argument types
     inferers = {mod.name: _TypeInferer(mod) for mod in modules}
@@ -175,35 +274,27 @@ def emit_cargo_project(target_path: Path, output_dir: Path | None = None) -> Pat
         inferers[mod.name]._finalize_unknown_params()
 
     all_names = [mod.name for mod in modules]
+    files: dict[str, str] = {}
     for idx, mod in enumerate(modules):
         is_entry = idx == 0
         env = envs[mod.name]
         ownership = analyze_ownership(mod, env)
         rust_code = generate_rust_module(mod, env, ownership, is_entry=is_entry, all_modules=all_names)
-        out_file = src_dir / ("main.rs" if is_entry else f"{mod.name}.rs")
-        out_file.write_text(rust_code, encoding="utf-8")
+        if is_entry:
+            # Generated code is not the user's to lint: keep cargo's output to real errors.
+            rust_code = "#![allow(warnings)]\n" + rust_code
+        files["main.rs" if is_entry else f"{mod.name}.rs"] = rust_code
 
+    _write_crate(output_dir, crate_name, files)
     return output_dir
 
 
 def find_cargo_executable() -> str | None:
-    found = shutil.which("cargo")
-    if found:
-        return found
-    cargo_home_bin = Path.home() / ".cargo" / "bin" / ("cargo.exe" if os.name == "nt" else "cargo")
-    if cargo_home_bin.exists():
-        return str(cargo_home_bin)
-    return None
+    return find_tool("cargo")
 
 
 def find_rustc_executable() -> str | None:
-    found = shutil.which("rustc")
-    if found:
-        return found
-    cargo_home_bin = Path.home() / ".cargo" / "bin" / ("rustc.exe" if os.name == "nt" else "rustc")
-    if cargo_home_bin.exists():
-        return str(cargo_home_bin)
-    return None
+    return find_tool("rustc")
 
 
 def doctor() -> dict[str, bool | str]:
@@ -238,64 +329,124 @@ def doctor() -> dict[str, bool | str]:
     }
 
 
+def rust_install_hint() -> str:
+    if os.name == "nt":
+        return "    winget install Rustlang.Rustup\n  or visit https://rustup.rs"
+    return "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n  or visit https://rustup.rs"
+
+
+def _environment_error(message: str) -> PyRustError:
+    """A failure caused by the machine (no cargo, killed build, linker missing...), not by the program.
+
+    Such failures are never remembered: the next run tries again.
+    """
+    exc = PyRustError(message)
+    exc.transient = True  # type: ignore[attr-defined]
+    return exc
+
+
+# A rustc diagnostic located in the generated sources: the generated code itself
+# is wrong, so building it again with the same toolchain cannot succeed.
+_GENUINE_ERROR = re.compile(r"^error(\[E\d+\])?: .*\n\s*--> src[/\\]", re.M)
+
+
+def _build_error_summary(stderr: str) -> str:
+    lines = [ln.strip() for ln in stderr.splitlines()]
+    for pattern in (r"^error\[E\d+\]: ", r"^error: (?!could not compile|aborting due to)"):
+        for line in lines:
+            if re.match(pattern, line):
+                return line
+    return next((ln for ln in lines if ln), "cargo exited with an error")
+
+
+def _failure_marker(crate_dir: Path, release: bool) -> Path:
+    # The crate folder name already includes the PyRust + toolchain salt, so a
+    # marker never outlives a Rust upgrade.
+    return crate_dir / f"build_failed_{'release' if release else 'debug'}.txt"
+
+
+def _bin_path(crate_dir: Path, crate_name: str, release: bool) -> Path:
+    exe_name = f"{crate_name}.exe" if os.name == "nt" else crate_name
+    return crate_dir / "target" / ("release" if release else "debug") / exe_name
+
+
+def native_build_status(target_path: Path, release: bool = True) -> tuple[str, str | None]:
+    """('built', binary) | ('failed', summary) | ('unbuilt', None) for the cached native build."""
+    crate_dir = default_crate_dir(target_path)
+    binary = _bin_path(crate_dir, _crate_name_for(Path(target_path).resolve()), release)
+    if binary.exists():
+        return "built", str(binary)
+    marker = _failure_marker(crate_dir, release)
+    if marker.exists():
+        text = marker.read_text(encoding="utf-8", errors="replace")
+        return "failed", _build_error_summary(text)
+    return "unbuilt", None
+
+
 def build_project(
     target_path: Path,
     output_dir: Path | None = None,
     release: bool = True,
 ) -> Path:
+    target_path = Path(target_path).resolve()
     crate_dir = emit_cargo_project(target_path, output_dir=output_dir)
     cargo_bin = find_cargo_executable()
     if not cargo_bin:
-        raise PyRustError(
+        exc = PyRustError(
             "Rust toolchain ('cargo') not found on PATH.\n"
             f"  Your Rust project was successfully generated at: {crate_dir}\n"
-            "  To compile and run native binaries, install Rust with:\n"
-            "    winget install Rustlang.Rustup\n"
-            "  or visit https://rustup.rs"
+            "  To compile and run native binaries, install Rust with:\n" + rust_install_hint()
         )
+        exc.no_cargo = True  # type: ignore[attr-defined]
+        raise exc
 
-    crate_name = _sanitize_crate_name(
-        Path(target_path).stem if Path(target_path).is_file() else Path(target_path).name
-    )
-    profile_dir = "release" if release else "debug"
-    exe_name = f"{crate_name}.exe" if os.name == "nt" else crate_name
-    bin_path = crate_dir / "target" / profile_dir / exe_name
-
+    bin_path = _bin_path(crate_dir, _crate_name_for(target_path), release)
     if bin_path.exists() and output_dir is None:
         return bin_path
 
-    # A failed build of this exact source is remembered so that falling back
-    # to CPython does not pay for a doomed `cargo build` on every run.
-    failed_marker = crate_dir / f"build_failed_{profile_dir}.txt"
+    # A failed build of this exact source (and toolchain) is remembered so that
+    # falling back to CPython does not pay for a doomed `cargo build` on every run.
+    failed_marker = _failure_marker(crate_dir, release)
     if failed_marker.exists() and output_dir is None:
-        raise PyRustError(
-            "Cargo build failed:\n" + failed_marker.read_text(encoding="utf-8", errors="replace")
-        )
+        text = failed_marker.read_text(encoding="utf-8", errors="replace")
+        raise PyRustError(f"Cargo build failed: {_build_error_summary(text)}\n{text}")
 
     cmd = [cargo_bin, "build", "--quiet"]
     if release:
         cmd.append("--release")
 
-    proc = subprocess.run(cmd, cwd=str(crate_dir), capture_output=True, text=True, check=False)
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(crate_dir), capture_output=True, text=True, errors="replace", check=False
+        )
+    except OSError as exc:
+        raise _environment_error(f"Cargo could not be started: {exc}") from exc
+    stderr = proc.stderr.strip()
     if proc.returncode != 0:
+        summary = _build_error_summary(stderr)
+        if proc.returncode < 0:
+            raise _environment_error(f"Cargo build was killed (signal {-proc.returncode})")
+        if not _GENUINE_ERROR.search(stderr):
+            raise _environment_error(f"Cargo build failed: {summary}\n{stderr}")
         try:
-            failed_marker.write_text(proc.stderr.strip(), encoding="utf-8")
+            failed_marker.write_text(stderr, encoding="utf-8")
         except OSError:
             pass
-        raise PyRustError(f"Cargo build failed:\n{proc.stderr.strip()}")
-
+        raise PyRustError(f"Cargo build failed: {summary}\n{stderr}")
+    if not bin_path.exists():
+        raise _environment_error(f"Cargo reported success but {bin_path} is missing")
     return bin_path
 
 
-def _entry_script(target_path: Path) -> Path:
+def entry_script(target_path: Path) -> Path:
     """The file CPython should execute for a script or project directory."""
     target_path = Path(target_path).resolve()
     if target_path.is_file():
         return target_path
-    modules = load_project(target_path)
-    if modules[0].path is None:
-        raise PyRustError(f"No entry module found in {target_path}")
-    return modules[0].path
+    return find_entry(target_path)
+
+
+_entry_script = entry_script  # backwards-compatible name
 
 
 _RUNNER_BOOT = (
@@ -319,7 +470,17 @@ def run_on_cpython(script: Path, args: list[str] | None = None, manifest: Path |
         str(Path(script).parent),
         *(args or []),
     ]
-    return subprocess.run(cmd, check=False).returncode
+    return run_child(cmd)
+
+
+def run_child(cmd: list[str]) -> int:
+    """Run a child process to completion; Ctrl-C reaches it directly, so just keep waiting."""
+    proc = subprocess.Popen(cmd)
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            continue
 
 
 def _first_line(exc: Exception) -> str:
@@ -342,6 +503,16 @@ class ExecutionPlan:
     manifest_path: Path | None = None
     native_blocker: str | None = None
     skipped: dict[str, str] = dataclasses.field(default_factory=dict)
+    # 'built' | 'unbuilt' for a native plan made without building (pyrust check).
+    native_status: str | None = None
+    # False when the blocker is a passing environment problem: do not cache this plan.
+    cacheable: bool = True
+    # The entry module is not valid Python.
+    syntax_error: bool = False
+    # Cargo is not installed (a native-capable program would run on CPython).
+    no_cargo: bool = False
+    hybrid_error: str | None = None
+    crate_dir: Path | None = None
 
     @property
     def native_functions(self) -> list[str]:
@@ -358,30 +529,64 @@ def plan_execution(target_path: Path, release: bool = True, build: bool = True) 
     from pyrust.hybrid import prepare_hybrid
 
     target_path = Path(target_path).resolve()
+    script = entry_script(target_path) if target_path.exists() else None
     blocker: str
+    cacheable = True
+    syntax_error = no_cargo = False
+    crate_dir: Path | None = None
     try:
         if build:
-            return ExecutionPlan("native", target_path, binary=build_project(target_path, release=release))
+            binary = build_project(target_path, release=release)
+            return ExecutionPlan("native", target_path, binary=binary, script=script)
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
             emit_cargo_project(target_path, output_dir=Path(tmp))
-        return ExecutionPlan("native", target_path)
+        status, detail = native_build_status(target_path, release)
+        if status == "failed":
+            raise PyRustError(f"Cargo build failed: {detail}")
+        plan = ExecutionPlan("native", target_path, script=script, native_status=status)
+        plan.no_cargo = status == "unbuilt" and find_cargo_executable() is None
+        if status == "built":
+            plan.binary = Path(detail)
+        return plan
     except PyRustError as exc:
         if not target_path.exists():
             raise
         blocker = _first_line(exc)
+        cacheable = not getattr(exc, "transient", False)
+        no_cargo = bool(getattr(exc, "no_cargo", False))
+        syntax_error = isinstance(exc, PyRustSyntaxError) and exc.filename == str(script)
+        if blocker.startswith("Cargo build failed"):
+            try:
+                crate_dir = default_crate_dir(target_path)
+            except Exception:  # noqa: BLE001
+                crate_dir = None
     except RecursionError:
         blocker = "program is too deeply nested for the transpiler"
     except Exception as exc:  # transpiler bug: the program must still run
         blocker = f"internal transpiler error ({type(exc).__name__}: {exc})"
 
-    script = _entry_script(target_path)
-    plan = ExecutionPlan("python", target_path, script=script, native_blocker=blocker)
+    if no_cargo:
+        blocker = "Rust toolchain ('cargo') not found, so the native build is skipped"
+    plan = ExecutionPlan(
+        "python",
+        target_path,
+        script=script,
+        native_blocker=blocker,
+        cacheable=cacheable,
+        syntax_error=syntax_error,
+        no_cargo=no_cargo,
+        crate_dir=crate_dir,
+    )
+    if syntax_error:
+        return plan
     try:
         manifest, hplan = prepare_hybrid(script, find_cargo_executable() if build else None)
     except Exception as exc:  # never let the accelerator break a runnable program
-        plan.skipped["*"] = f"hybrid planning failed ({type(exc).__name__}: {exc})"
+        detail = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+        plan.hybrid_error = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+        plan.skipped["*"] = f"hybrid planning failed ({plan.hybrid_error})"
         return plan
     if hplan is not None:
         plan.skipped = dict(hplan.skipped)
@@ -397,27 +602,88 @@ def plan_execution(target_path: Path, release: bool = True, build: bool = True) 
     return plan
 
 
+def _recipe_from_plan(plan: ExecutionPlan) -> dict:
+    dll = (plan.manifest or {}).get("dll") or None
+    return {
+        "tier": plan.tier,
+        "binary": str(plan.binary) if plan.binary else None,
+        "script": str(plan.script) if plan.script else None,
+        "manifest_path": str(plan.manifest_path) if plan.manifest_path else None,
+        # Checked by load_plan: a deleted native library must trigger a rebuild.
+        "dll": str(dll) if dll and plan.manifest_path else None,
+        "blocker": plan.native_blocker,
+        "names": plan.native_functions,
+        "crate_dir": str(plan.crate_dir) if plan.crate_dir else None,
+        "hybrid_error": plan.hybrid_error,
+    }
+
+
 def resolve_run_plan(target_path: Path, release: bool = True) -> dict:
     """The (cached) launch recipe for `target_path` as a plain dict.
 
-    Keys: tier, binary, script, manifest_path, blocker, names.
+    Keys: tier, binary, script, manifest_path, dll, blocker, names, ...
     """
     cached = load_plan(str(target_path), release)
     if cached is not None:
         return cached
     plan = plan_execution(target_path, release=release)
-    recipe = {
-        "tier": plan.tier,
-        "binary": str(plan.binary) if plan.binary else None,
-        "script": str(plan.script) if plan.script else None,
-        "manifest_path": str(plan.manifest_path) if plan.manifest_path else None,
-        "blocker": plan.native_blocker,
-        "names": plan.native_functions,
-    }
-    # Without cargo the answer may change once Rust is installed: do not pin it.
-    if plan.tier == "native" or find_cargo_executable() is not None:
-        save_plan(str(target_path), recipe, release)
+    recipe = _recipe_from_plan(plan)
+    if not plan.cacheable:
+        return recipe
+    deps, absent = project_files(Path(target_path))
+    from pyrust.plancache import file_digest
+
+    recipe["deps"] = [[str(p), file_digest(str(p))] for p in deps]
+    recipe["absent"] = [str(p) for p in absent]
+    plan_file = save_plan(str(target_path), recipe, release)
+    if plan_file is not None:
+        prune_cache(Path(target_path).resolve(), Path(plan_file), recipe)
     return recipe
+
+
+_HEX16 = "[0-9a-f]{16}"
+
+
+def prune_cache(target_path: Path, plan_file: Path, recipe: dict) -> None:
+    """Delete this program's superseded builds and plans (each edit would otherwise leave ~1 MB behind)."""
+    folder = plan_file.parent
+    keep: set[Path] = {plan_file}
+    for key, depth in (("binary", 3), ("manifest_path", 1), ("crate_dir", 0)):
+        value = recipe.get(key)
+        if value:
+            keep.add(Path(value).parents[depth - 1] if depth else Path(value))
+    crate = re.escape(_crate_name_for(target_path))
+    script = Path(recipe.get("script") or target_path)
+    hstem = re.escape("".join(c if c.isalnum() else "_" for c in script.stem.lower()) or "app")
+    stem = re.escape(plan_file.name.rsplit("_", 1)[0])  # plan_<name>
+    patterns = [
+        re.compile(rf"{crate}_{_HEX16}"),
+        re.compile(rf"{hstem}_hybrid_{_HEX16}"),
+        re.compile(rf"{stem}_{_HEX16}\.bin"),
+    ]
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry in keep or not any(p.fullmatch(entry.name) for p in patterns):
+            continue
+        if entry.is_dir():
+            owner = entry / ".pyrust-target"
+            # Only folders this exact program created (two scripts may share a stem).
+            if owner.exists() and owner.read_text(encoding="utf-8", errors="replace") == str(target_path):
+                shutil.rmtree(entry, ignore_errors=True)
+        else:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+    for kept in keep:
+        if kept.is_dir() and kept.parent == folder:
+            try:
+                (kept / ".pyrust-target").write_text(str(target_path), encoding="utf-8")
+            except OSError:
+                pass
 
 
 def run_project(
@@ -429,13 +695,13 @@ def run_project(
 ) -> int:
     if native_only:
         bin_path = build_project(target_path, release=release)
-        return subprocess.run([str(bin_path), *(args or [])], check=False).returncode
+        return run_child([str(bin_path), *(args or [])])
 
     from pyrust.cli import describe_fallback
 
     recipe = resolve_run_plan(target_path, release=release)
     if recipe["tier"] == "native":
-        return subprocess.run([recipe["binary"], *(args or [])], check=False).returncode
+        return run_child([recipe["binary"], *(args or [])])
     if not quiet:
         describe_fallback(recipe)
     manifest = Path(recipe["manifest_path"]) if recipe["manifest_path"] else None
