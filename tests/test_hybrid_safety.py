@@ -449,4 +449,31 @@ def test_multi_signature_build_runs_both_natively(tmp_path: Path):
         [sys.executable, "-m", "pyrust.cli", "run", "-q", str(script)], capture_output=True, text=True, env=env
     )
     assert got.stdout == expected, got.stderr
-    assert json.loads((Path(manifest["dll"]).parents[2] / "manifest.json").read_text())["version"] == 2
+    saved = json.loads((Path(manifest["dll"]).parents[2] / "manifest.json").read_text())
+    assert saved["version"] == hybrid.MANIFEST_VERSION
+
+
+@needs_cargo
+def test_exports_are_called_as_builtin_functions(tmp_path: Path):
+    from pyrust.hybrid_runner import make_accelerators
+
+    script = tmp_path / "prog.py"
+    src = (
+        "import collections\n"
+        "def total(n, x, flag):\n    t = 0.0\n    for i in range(n):\n        t += x if flag else -x\n    return t\n"
+        "def big(n):\n    r = 1\n    for i in range(n):\n        r = r * 3\n    return r\n"
+        "def odd(n):\n    r = False\n    for _ in range(1):\n        r = n % 2 == 1\n    return r\n"
+        "print(total(3, 1.5, True), big(5), odd(3))\n"
+    )
+    script.write_text(src, encoding="utf-8")
+    manifest, _ = prepare_hybrid(script, find_cargo_executable())
+    accel = make_accelerators(manifest)
+    ns = {"__name__": "prog", "__pyrust_accel__": accel}
+    exec(instrument(src.rsplit("print", 1)[0], str(script), set(accel)), ns)
+    for name in ("total", "big", "odd"):
+        cells = [c.cell_contents for c in ns[name].__closure__]
+        natives = [c for c in cells if type(c).__name__ == "builtin_function_or_method"]
+        assert natives and natives[0].__name__ == name
+    assert ns["total"](3, 1.5, True) == 4.5 and ns["total"](3, 1.5, False) == -4.5
+    assert ns["big"](5) == 243 and ns["big"](50) == 3**50  # overflow: native returns None, Python finishes
+    assert ns["odd"](3) is True and ns["odd"](4) is False

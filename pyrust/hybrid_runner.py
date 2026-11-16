@@ -25,6 +25,8 @@ _RETURN = {
     "int": "if __pyr_r != -9223372036854775808 or not __pyr_err():\n    return __pyr_r\n",
     "float": "if __pyr_r == __pyr_r or not __pyr_err():\n    return __pyr_r\n",
     "bool": "if __pyr_r < 2:\n    return __pyr_r == 1\n",
+    # Exports called as CPython builtin functions return the result object, or None on failure.
+    "object": "if __pyr_r is not None:\n    return __pyr_r\n",
 }
 
 # The `def` statement of each accelerated function, by (filename, name), saved
@@ -130,6 +132,7 @@ def make_accelerators(manifest: dict) -> dict:
     take_error.argtypes = []
     take_error.restype = ctypes.c_int32
     ctx = _Context(take_error)
+    builtin_fn = _fast_calls(lib, ctypes)
     accel: dict = {}
     for spec in manifest["functions"]:
         if "deps" not in spec:
@@ -139,6 +142,10 @@ def make_accelerators(manifest: dict) -> dict:
         ]
         calls = []
         for var in variants:
+            fast = builtin_fn(var["symbol"]) if builtin_fn else None
+            if fast is not None:
+                calls.append((dict(var, protocol="object"), fast))
+                continue
             cfunc = getattr(lib, var["symbol"])
             cfunc.argtypes = [_CTYPES[p] for p in var["params"]]
             cfunc.restype = _CTYPES[var["ret"]]
@@ -153,6 +160,46 @@ def make_accelerators(manifest: dict) -> dict:
             if dep not in accel:
                 accel[dep] = lambda orig, _name=dep: ctx.register(_name, orig)
     return accel
+
+
+def _fast_calls(lib, ctypes):
+    """symbol -> the export as a CPython builtin function (None: use ctypes for it).
+
+    A ctypes call spends most of its time in libffi; a METH_FASTCALL builtin
+    costs a fraction of that. The library gets the few C-API functions it
+    needs by pointer, so it never links against a particular Python.
+    """
+    if sys.implementation.name != "cpython":
+        return None
+    try:
+        api = ctypes.pythonapi
+        names = ("as_i64", "from_i64", "as_f64", "from_f64", "save_thread", "restore_thread", "incref")
+        funcs = ("PyLong_AsLongLong", "PyLong_FromLongLong", "PyFloat_AsDouble", "PyFloat_FromDouble",
+                 "PyEval_SaveThread", "PyEval_RestoreThread", "Py_IncRef")
+
+        class PyApi(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_void_p) for n in names + ("none", "py_true", "py_false")]
+
+        table = PyApi(*[ctypes.cast(getattr(api, f), ctypes.c_void_p).value for f in funcs], id(None), id(True), id(False))
+        lib.pyr_set_api.argtypes = [ctypes.POINTER(PyApi)]
+        lib.pyr_set_api.restype = None
+        lib.pyr_set_api(ctypes.byref(table))
+        new_function = api.PyCFunction_NewEx
+        new_function.argtypes = [ctypes.c_void_p, ctypes.py_object, ctypes.py_object]
+        new_function.restype = ctypes.py_object
+    except (AttributeError, OSError, ValueError, TypeError):
+        return None
+
+    def make(symbol: str):
+        try:
+            method_def = getattr(lib, symbol.replace("pyr_export_", "pyr_def_", 1))
+        except AttributeError:
+            return None
+        method_def.argtypes = []
+        method_def.restype = ctypes.c_void_p
+        return new_function(method_def(), None, None)
+
+    return make
 
 
 def _relocate(node, lineno: int) -> None:
@@ -225,9 +272,9 @@ def _wrap(orig, spec: dict, calls: list, ctx: _Context):
         guard = " and ".join(_GUARD[p].format(a=a) for p, a in zip(var["params"], argnames)) or "True"
         lines.append(f"{'if' if i == 0 else 'elif'} {guard}{' and ' + check if check else ''}:")
         lines.append(f"    __pyr_r = __pyr_c{i}({args})")
-        lines += ["    " + line for line in _RETURN[var["ret"]].splitlines()]
+        lines += ["    " + line for line in _RETURN[var.get("protocol", var["ret"])].splitlines()]
         bind(f"__pyr_c{i}", cfunc)
-    if any(var["ret"] != "bool" for var, _ in calls):
+    if any(var.get("protocol", var["ret"]) in ("int", "float") for var, _ in calls):
         bind("__pyr_err", ctx.take_error)
     guard_src = "\n".join(lines)
     if terms:  # a missing global raises KeyError in the check: run the original

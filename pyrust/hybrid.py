@@ -60,7 +60,7 @@ MAX_SIGNATURES = 4
 MAX_BUILDS = 4
 
 # Bumped whenever the manifest format changes (older cached manifests are rebuilt).
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 _BANNED_NODES: tuple[type, ...] = (
     ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await, ast.Try,
@@ -930,6 +930,103 @@ def _module_name(index: int) -> str:
     return "accel" if index == 0 else f"accel_v{index}"
 
 
+# Second calling convention: each export is also a CPython builtin function
+# (METH_FASTCALL) created at load time with PyCFunction_NewEx. That skips the
+# ctypes/libffi machinery, which costs most of a ctypes call. The library does
+# not link against Python: the few C-API functions it needs are handed over by
+# pointer (`pyr_set_api`). The Python guard has already checked every argument's
+# exact type and range, so the conversions cannot fail. A bail-out returns None.
+_FAST_PRELUDE = """type PyObj = *mut std::ffi::c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PyApi {
+    as_i64: unsafe extern "C" fn(PyObj) -> i64,
+    from_i64: unsafe extern "C" fn(i64) -> PyObj,
+    as_f64: unsafe extern "C" fn(PyObj) -> f64,
+    from_f64: unsafe extern "C" fn(f64) -> PyObj,
+    save_thread: unsafe extern "C" fn() -> *mut std::ffi::c_void,
+    restore_thread: unsafe extern "C" fn(*mut std::ffi::c_void),
+    incref: unsafe extern "C" fn(PyObj),
+    none: PyObj,
+    py_true: PyObj,
+    py_false: PyObj,
+}
+
+static mut PYR_API: std::mem::MaybeUninit<PyApi> = std::mem::MaybeUninit::uninit();
+
+#[no_mangle]
+pub unsafe extern "C" fn pyr_set_api(api: *const PyApi) {
+    std::ptr::addr_of_mut!(PYR_API).write(std::mem::MaybeUninit::new(*api));
+}
+
+#[inline(always)]
+unsafe fn pyr_api() -> &'static PyApi {
+    &*std::ptr::addr_of!(PYR_API).cast::<PyApi>()
+}
+
+#[repr(C)]
+pub struct PyMethodDef {
+    name: *const std::ffi::c_char,
+    meth: unsafe extern "C" fn(PyObj, *const PyObj, isize) -> PyObj,
+    flags: std::ffi::c_int,
+    doc: *const std::ffi::c_char,
+}
+unsafe impl Sync for PyMethodDef {}
+
+#[inline(always)]
+unsafe fn pyr_bool(api: &PyApi, v: bool) -> PyObj {
+    let o = if v { api.py_true } else { api.py_false };
+    (api.incref)(o);
+    o
+}
+
+#[inline(always)]
+unsafe fn pyr_none(api: &PyApi) -> PyObj {
+    (api.incref)(api.none);
+    api.none
+}
+"""
+
+_FAST_ARG = {
+    "int": "(api.as_i64)(*args.add({i}))",
+    "float": "(api.as_f64)(*args.add({i}))",
+    "bool": "*args.add({i}) == api.py_true",
+}
+_FAST_RET = {"int": "(api.from_i64)(v)", "float": "(api.from_f64)(v)", "bool": "pyr_bool(api, v)"}
+
+
+def _fast_export(name: str, var: Variant) -> list[str]:
+    sym = var.symbol(name)
+    fast = sym.replace("pyr_export_", "pyr_fast_", 1)
+    lines = [f"unsafe extern \"C\" fn {fast}(_s: PyObj, args: *const PyObj, _n: isize) -> PyObj {{", "    let api = pyr_api();"]
+    for i, t in enumerate(var.params):
+        lines.append(f"    let a{i} = {_FAST_ARG[t].format(i=i)};")
+    call_args = ", ".join(f"a{i}" for i in range(len(var.params)))
+    lines += [
+        "    let ts = (api.save_thread)();  // the native code touches no Python object",
+        f"    let r = std::panic::catch_unwind(|| {_module_name(var.index)}::{name}({call_args}));",
+        "    (api.restore_thread)(ts);",
+        "    match r {",
+        f"        Ok(v) => {_FAST_RET[var.ret]},",
+        "        Err(_) => pyr_none(api),",
+        "    }",
+        "}",
+        f"static {fast.upper()}_DEF: PyMethodDef = PyMethodDef {{",
+        f'    name: b"{name}\\0".as_ptr() as *const std::ffi::c_char,',
+        f"    meth: {fast},",
+        "    flags: 0x80,  // METH_FASTCALL",
+        "    doc: std::ptr::null(),",
+        "};",
+        "#[no_mangle]",
+        f'pub extern "C" fn {sym.replace("pyr_export_", "pyr_def_", 1)}() -> *const PyMethodDef {{',
+        f"    &{fast.upper()}_DEF",
+        "}",
+        "",
+    ]
+    return lines
+
+
 def _lib_rs(plan: HybridPlan) -> str:
     out = [
         "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_snake_case)]",
@@ -957,6 +1054,7 @@ def _lib_rs(plan: HybridPlan) -> str:
         "    PYR_FAILED.with(|f| f.replace(false)) as i32",
         "}",
         "",
+        _FAST_PRELUDE,
     ]
     for fn in plan.functions:
         for var in fn.variants:
@@ -976,6 +1074,7 @@ def _lib_rs(plan: HybridPlan) -> str:
                 "}",
                 "",
             ]
+            out += _fast_export(fn.name, var)  # after the C export, so rustc errors map to this function
     return "\n".join(out)
 
 
