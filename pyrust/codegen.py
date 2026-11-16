@@ -1514,6 +1514,23 @@ class _RustGenerator:
             return f"{self.self_var_name}.{node.attr}"
         return f"{self._recv_no_clone(node.value, scope, plan)}.{node.attr}"
 
+    def _borrowed_base(self, node: ast.expr, scope: ScopeInfo, plan: OwnershipPlan) -> str:
+        """An expression for a subscript's base that is only borrowed: nested
+        reads like `a[i][j]` or `d[k][j]` must not copy the inner container."""
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
+            bt = scope.expr_types.get(id(node.value), UNKNOWN)
+            kt = scope.expr_types.get(id(node.slice), UNKNOWN)
+            if isinstance(bt, ListType) and kt in (INT, BOOL):
+                inner = self._borrowed_base(node.value, scope, plan)
+                idx = self._expr(node.slice, scope, plan, expected_type=INT)
+                return f"(*py_index_ref(&{inner}, {idx}))"
+            if isinstance(bt, DictType) and kt == bt.key:
+                inner = self._borrowed_base(node.value, scope, plan)
+                return f"({inner}[&{self._expr(node.slice, scope, plan)}])"
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return self._recv_no_clone(node, scope, plan)
+        return self._expr(node, scope, plan)
+
     def _recv_no_clone(self, node: ast.expr, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         """Receiver for method calls / &mut bases: never clone (borrows)."""
         code = self._expr(node, scope, plan)
@@ -2067,7 +2084,7 @@ class _RustGenerator:
 
     def _sum_call(self, node: ast.Call, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         at = scope.expr_types.get(id(node.args[0]), UNKNOWN)
-        inner = self._expr(node.args[0], scope, plan)
+        inner = self._recv_no_clone(node.args[0], scope, plan)
         if isinstance(at, ListType):
             elem, seq = at.elem, f"&{inner}"
         elif isinstance(at, SetType) and at.elem in (INT, BOOL):
@@ -2359,7 +2376,8 @@ class _RustGenerator:
                             col=getattr(node, "col_offset", None),
                             filename=self.parsed.filename,
                         )
-                    c_code = self._expr(right_node, scope, plan)
+                    # Membership only reads the container: borrow, never copy it.
+                    c_code = self._recv_no_clone(right_node, scope, plan)
                     l_code = self._expr(left_node, scope, plan)
                     if container_t == ANY:
                         check = f"py_value_contains(&{c_code}, &PyValue::from({l_code}))"
@@ -2526,7 +2544,7 @@ class _RustGenerator:
 
         if isinstance(node, ast.Subscript):
             val_t = scope.expr_types.get(id(node.value), UNKNOWN)
-            val_code = self._expr(node.value, scope, plan)
+            val_code = self._borrowed_base(node.value, scope, plan)
             if isinstance(node.slice, ast.Slice):
                 low = f"Some({self._expr(node.slice.lower, scope, plan)})" if node.slice.lower else "None"
                 high = f"Some({self._expr(node.slice.upper, scope, plan)})" if node.slice.upper else "None"
@@ -3493,8 +3511,8 @@ class _RustGenerator:
             if fname == "len" and len(node.args) == 1:
                 lt = scope.expr_types.get(id(node.args[0]), UNKNOWN)
                 if lt == STR:
-                    return f"py_str_len(&{self._expr(node.args[0], scope, plan)})"
-                return f"({self._expr(node.args[0], scope, plan)}.len() as i64)"
+                    return f"py_str_len(&{self._recv_no_clone(node.args[0], scope, plan)})"
+                return f"({self._recv_no_clone(node.args[0], scope, plan)}.len() as i64)"
 
             if fname == "repr" and len(node.args) == 1:
                 self._check_printable(scope.expr_types.get(id(node.args[0]), UNKNOWN), node.args[0])
@@ -3593,7 +3611,7 @@ class _RustGenerator:
                             filename=self.parsed.filename,
                         )
                 at_sorted = scope.expr_types.get(id(node.args[0]), UNKNOWN)
-                inner = self._expr(node.args[0], scope, plan)
+                inner = self._recv_no_clone(node.args[0], scope, plan)
                 if at_sorted == STR:
                     items = f"{inner}.chars().map(|c| c.to_string()).collect::<Vec<String>>()"
                 elif isinstance(at_sorted, SetType):
@@ -3758,7 +3776,7 @@ class _RustGenerator:
                         filename=self.parsed.filename,
                     )
                 if len(node.args) == 1:
-                    inner = self._expr(node.args[0], scope, plan)
+                    inner = self._recv_no_clone(node.args[0], scope, plan)
                     at = scope.expr_types.get(id(node.args[0]), ListType(INT))
                     if at == STR:
                         return f"py_{fname}_str(&{inner})"

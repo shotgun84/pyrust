@@ -2243,6 +2243,15 @@ pub fn py_index<T: Clone>(items: &[T], idx: i64) -> T {
     }
 }
 
+/// `seq[i]` borrowed (nested reads `a[i][j]` without copying the row).
+#[inline]
+pub fn py_index_ref<T>(items: &[T], idx: i64) -> &T {
+    match py_norm_index(items.len(), idx) {
+        Some(i) => &items[i],
+        None => py_raise("IndexError: list index out of range".to_string()),
+    }
+}
+
 /// `seq[i]` as a mutable place (nested assignment `a[i][j] = v`).
 #[inline]
 pub fn py_index_mut<T>(items: &mut [T], idx: i64) -> &mut T {
