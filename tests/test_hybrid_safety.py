@@ -28,6 +28,128 @@ I64_MIN = -(2**63)
 
 
 # --------------------------------------------------------------------------
+# Static analysis
+# --------------------------------------------------------------------------
+
+
+def test_star_import_of_local_module_counts_the_names_it_binds(tmp_path: Path):
+    (tmp_path / "local_settings.py").write_text("SCALE = 10\ndef helper(x):\n    return x * 1000\n_hidden = 1\n")
+    src = (
+        "import collections\nSCALE = 3\n_hidden = 2\n"
+        "def helper(x):\n    return x + 1\n"
+        "def compute(n):\n    t = 0\n    for i in range(n):\n        t += i * SCALE + helper(i)\n    return t\n"
+        "def private(n):\n    t = 0\n    for i in range(n):\n        t += _hidden\n    return t\n"
+        "from local_settings import *\n"
+        "print(compute(4), private(2))\n"
+    )
+    plan = plan_hybrid(src, str(tmp_path / "main.py"))
+    assert "compute" not in plan.names
+    assert plan.skipped["helper"] == "is rebound elsewhere in the module"
+    assert "private" in plan.names  # `_hidden` is not exported by `import *`
+
+
+def test_star_import_with_unknown_names_blocks_everything(tmp_path: Path):
+    src = (
+        "from not_a_real_module_xyz import *\n"
+        "def f(n):\n    t = 0\n    for i in range(n):\n        t += abs(i)\n    return t\n"
+        "print(f(3))\n"
+    )
+    plan = plan_hybrid(src, str(tmp_path / "main.py"))
+    assert plan.names == []
+    assert "not_a_real_module_xyz import *" in plan.skipped["f"]
+
+
+def test_star_import_respects_literal_all(tmp_path: Path):
+    (tmp_path / "mod.py").write_text("__all__ = ['OTHER']\nK = 5\nOTHER = 1\n")
+    src = (
+        "K = 2\n"
+        "def f(n):\n    t = 0\n    for i in range(n):\n        t += K\n    return t\n"
+        "from mod import *\nprint(f(3))\n"
+    )
+    assert plan_hybrid(src, str(tmp_path / "main.py")).names == ["f"]
+
+
+def test_except_as_and_match_captures_are_bindings():
+    src = (
+        "RATE = 2\nBASE = 10\n"
+        "def helper(x):\n    return x + 1\n"
+        "def scaled(n):\n    t = 0\n    for i in range(n):\n        t += RATE\n    return t\n"
+        "def based(n):\n    t = 0\n    for i in range(n):\n        t += BASE\n    return t\n"
+        "def helped(n):\n    t = 0\n    for i in range(n):\n        t += helper(i)\n    return t\n"
+        "try:\n    int('x')\nexcept ValueError as RATE:\n    pass\n"
+        "match 99:\n    case BASE:\n        pass\n"
+        "match [1]:\n    case [*helper]:\n        pass\n"
+    )
+    plan = plan_hybrid(src, "x.py")
+    assert plan.names == []
+    assert plan.skipped["scaled"] == "reads global 'RATE'"
+    assert plan.skipped["based"] == "reads global 'BASE'"
+    assert plan.skipped["helper"] == "is rebound elsewhere in the module"
+
+
+def test_dependencies_are_transitive():
+    src = (
+        "import math\nLIMIT = 5\nHALF = 0.5\n"
+        "def step(x):\n    return x + LIMIT\n"
+        "def run(n):\n    t = 0\n    for i in range(n):\n        t = step(t)\n    return t\n"
+        "def outer(n):\n    t = 0.0\n    for i in range(n):\n        t += run(2) * HALF + math.sqrt(abs(i))\n    return t\n"
+        "def rec(n):\n    return 0 if n <= 0 else 1 + rec(n - 1)\n"
+        "print(outer(3), rec(3))\n"
+    )
+    plan = plan_hybrid(src, "x.py")
+    deps = {f.name: f.deps for f in plan.functions}
+    assert deps["run"] == {"funcs": ["step"], "consts": {"LIMIT": ["int", 5]}, "math": None, "builtins": ["range"]}
+    assert deps["outer"] == {
+        "funcs": ["run", "step"],
+        "consts": {"HALF": ["float", (0.5).hex()], "LIMIT": ["int", 5]},
+        "math": ["sqrt"],
+        "builtins": ["abs", "range"],
+    }
+    assert deps["rec"]["funcs"] == ["rec"]  # recursion: its own global name is a dependency
+
+
+def test_disagreeing_call_sites_get_one_signature_each():
+    src = (
+        "import collections\n"
+        "def fact(n):\n    r = 1\n    i = 2\n    while i <= n:\n        r = r * i\n        i += 1\n    return r\n"
+        "print(fact(20), fact(20), fact(5.0))\n"
+    )
+    plan = plan_hybrid(src, "x.py")
+    (fact,) = plan.functions
+    assert [(v.params, v.ret) for v in fact.variants] == [(["int"], "int"), (["float"], "int")]
+    assert (fact.params, fact.ret) == (["int"], "int")  # the most common call site first
+    assert plan.variant_sources[1] and "pub fn fact(n: f64) -> i64" in plan.variant_sources[1]
+
+
+def test_variant_count_is_capped():
+    calls = "f(1, 1)\nf(1.0, 1)\nf(1, 1.0)\nf(1.0, 1.0)\nf(True, 1)\nf(1, True)\n"
+    src = "def f(a, b):\n    t = 0\n    for i in range(3):\n        t = t + a * b\n    return t\n" + calls
+    (f,) = plan_hybrid(src, "x.py").functions
+    assert len(f.variants) <= hybrid.MAX_SIGNATURES
+
+
+def test_literal_iteration_gives_type_hints():
+    src = (
+        "def fdiv(a, b):\n    r = 0.0\n    for _ in range(1):\n        r = a // b\n    return r\n"
+        "nan = float('nan')\n"
+        "for a, b in [(1.0, 0.1), (-7.5, 2.0), (nan, 1.0)]:\n    print(fdiv(a, b))\n"
+    )
+    (f,) = plan_hybrid(src, "x.py").functions
+    assert f.params == ["float", "float"]
+
+
+def test_unhinted_signature_is_a_reported_guess():
+    src = (
+        "def total(n):\n    t = 0\n    for i in range(3):\n        t = t + n\n    return t\n"
+        "for f in [total]:\n    print(f(2), f(2.5))\n"
+    )
+    plan = plan_hybrid(src, "x.py")
+    (total,) = plan.functions
+    assert [v.params for v in total.variants] == [["int"], ["float"]]
+    assert "guessed" in plan.notes["total"]
+
+
+# --------------------------------------------------------------------------
 # Runtime guard machinery (fake native functions, no Rust needed)
 # --------------------------------------------------------------------------
 
@@ -268,3 +390,63 @@ def test_instrument_drops_the_accel_table_after_the_last_def():
     assert ns["seen"] is True and "__pyrust_accel__" not in ns
 
 
+# --------------------------------------------------------------------------
+# Builds (need cargo)
+# --------------------------------------------------------------------------
+
+
+GOOD_AND_BAD = (
+    "import collections\n"
+    "def good(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t\n"
+    "def bad(n):\n    t = 0\n    for i in range(n):\n        t += i * 2\n    return t\n"
+    "def uses_bad(n):\n    t = 0\n    for i in range(n):\n        t += bad(i)\n    return t\n"
+    "def also_good(x):\n    t = 0.0\n    for i in range(3):\n        t += x\n    return t\n"
+    "print(good(10), bad(10), uses_bad(10), also_good(1.5))\n"
+)
+
+
+@needs_cargo
+def test_one_function_failing_to_build_does_not_drop_the_others(tmp_path: Path, monkeypatch):
+    import pyrust.codegen as codegen
+
+    real = codegen.generate_rust_module
+
+    def broken(*args, **kwargs):
+        rust = real(*args, **kwargs)
+        # Simulate a codegen bug confined to `bad`: a type error rustc will reject.
+        return rust.replace("pub fn bad(n: i64) -> i64 {", 'pub fn bad(n: i64) -> i64 {\n    let _oops: i64 = "x";', 1)
+
+    monkeypatch.setattr(codegen, "generate_rust_module", broken)
+    script = tmp_path / "prog.py"
+    script.write_text(GOOD_AND_BAD, encoding="utf-8")
+    manifest, plan = prepare_hybrid(script, find_cargo_executable())
+    assert manifest is not None
+    assert sorted(f["name"] for f in manifest["functions"]) == ["also_good", "good"]
+    assert "failed to compile" in manifest["skipped"]["bad"] and "mismatched types" in manifest["skipped"]["bad"]
+    assert "bad" in manifest["skipped"]["uses_bad"]
+    # `pyrust check` reads the cached manifest and reports each reason.
+    checked = plan_execution(script, build=False)
+    assert checked.native_functions == ["good", "also_good"]
+    assert "failed to compile" in checked.skipped["bad"]
+
+
+@needs_cargo
+def test_multi_signature_build_runs_both_natively(tmp_path: Path):
+    script = tmp_path / "prog.py"
+    script.write_text(
+        "import collections\n"
+        "def fact(n):\n    r = 1\n    i = 2\n    while i <= n:\n        r = r * i\n        i += 1\n    return r\n"
+        "native = []\n"
+        "print(fact(20), fact(20), fact(5.0), fact(30), fact(True))\n",
+        encoding="utf-8",
+    )
+    manifest, _ = prepare_hybrid(script, find_cargo_executable())
+    (spec,) = manifest["functions"]
+    assert [v["params"] for v in spec["variants"]] == [["int"], ["float"]]
+    expected = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, check=True).stdout
+    env = dict(os.environ, PYTHONPATH=str(Path(hybrid.__file__).parents[1]))
+    got = subprocess.run(
+        [sys.executable, "-m", "pyrust.cli", "run", "-q", str(script)], capture_output=True, text=True, env=env
+    )
+    assert got.stdout == expected, got.stderr
+    assert json.loads((Path(manifest["dll"]).parents[2] / "manifest.json").read_text())["version"] == 2
