@@ -174,3 +174,27 @@ def test_toolchain_identity_is_part_of_the_cache_key(tmp_path: Path):
     assert with_cargo.returncode == without.returncode == 0
     if HAS_CARGO:
         assert with_cargo.stdout != without.stdout
+
+
+# ------------------------------------------------------------ A6 entry point
+
+
+def test_directory_entry_matches_python(tmp_path: Path):
+    proj = tmp_path / "d1"
+    proj.mkdir()
+    (proj / "__main__.py").write_text(f"{PYTHON_TIER}print('dunder main')\n", encoding="utf-8")
+    (proj / "app.py").write_text("print('app')\n", encoding="utf-8")
+    expected = python("d1", cwd=tmp_path)
+    assert expected.stdout == "dunder main\n"
+    res = pyrust("run", "d1", cwd=tmp_path)
+    assert res.stdout == expected.stdout, res.stderr
+
+
+def test_directory_entry_fallback_is_alphabetical_across_extensions(tmp_path: Path):
+    from pyrust.parser import find_entry
+
+    (tmp_path / "zeta.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "beta.pyr").write_text("print(2)\n", encoding="utf-8")
+    assert find_entry(tmp_path).name == "beta.pyr"
+    (tmp_path / "beta.py").write_text("print(3)\n", encoding="utf-8")
+    assert find_entry(tmp_path).name == "beta.pyr"  # .pyr wins on a stem tie, like the import hook
