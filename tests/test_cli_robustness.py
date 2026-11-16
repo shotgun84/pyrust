@@ -257,6 +257,51 @@ def test_directory_entry_fallback_is_alphabetical_across_extensions(tmp_path: Pa
     assert find_entry(tmp_path).name == "beta.pyr"  # .pyr wins on a stem tie, like the import hook
 
 
+# ------------------------------------------------------------- B1/B2 encodings
+
+
+@pytest.mark.parametrize("prefix", ["", PYTHON_TIER])
+def test_utf8_bom_source(tmp_path: Path, prefix: str):
+    (tmp_path / "bom.py").write_bytes(b"\xef\xbb\xbf" + f"{prefix}print('hé')\n".encode("utf-8"))
+    expected = python("bom.py", cwd=tmp_path)
+    assert expected.returncode == 0
+    res = pyrust("run", "bom.py", cwd=tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == expected.stdout
+
+
+@pytest.mark.parametrize("prefix", ["", PYTHON_TIER])
+def test_pep263_latin1_source(tmp_path: Path, prefix: str):
+    src = f"# -*- coding: latin-1 -*-\n{prefix}print('café')\n".encode("latin-1")
+    (tmp_path / "lat.py").write_bytes(src)
+    expected = python("lat.py", cwd=tmp_path)
+    assert expected.stdout == "café\n"
+    res = pyrust("run", "lat.py", cwd=tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == expected.stdout
+
+
+def test_undecodable_unrelated_file_in_project_is_ignored(tmp_path: Path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    (proj / "junk.py").write_bytes(b"x = '\xe9\xff'\n")
+    res = pyrust("run", "proj", cwd=tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == "ok\n"
+
+
+def test_undecodable_entry_reports_python_syntax_error(tmp_path: Path):
+    (tmp_path / "bad.py").write_bytes(b"import collections\nx = '\xe9'\nprint(x)\n")
+    expected = python("bad.py", cwd=tmp_path)
+    res = pyrust("run", "bad.py", cwd=tmp_path)
+    assert res.returncode == expected.returncode == 1
+    assert "Traceback" not in res.stderr
+    prefix = "SyntaxError: Non-UTF-8 code starting with '\\xe9'"
+    assert expected.stderr.strip().splitlines()[-1].startswith(prefix)
+    assert res.stderr.strip().splitlines()[-1].startswith(prefix)
+
+
 # ------------------------------------------------------------- B3 cargo names
 
 
@@ -359,6 +404,49 @@ def test_fallback_runs_entry_even_if_a_reachable_module_is_broken(tmp_path: Path
     res = pyrust("run", "proj", cwd=tmp_path)
     assert res.stdout == expected.stdout
     assert res.returncode == expected.returncode
+    assert res.stderr.strip().splitlines()[-1] == expected.stderr.strip().splitlines()[-1]
+
+
+# ------------------------------------------------------------- C4 __main__
+
+
+def test_main_module_attributes_match_python(tmp_path: Path):
+    probe = (
+        f"{PYTHON_TIER}import sys, builtins\n"
+        "print(type(__builtins__).__name__, __builtins__ is builtins)\n"
+        "print(__builtins__.abs(-3))\n"
+        "print(type(__loader__).__name__, __spec__, __package__, __cached__)\n"
+        "print(sorted(k for k in globals() if k.startswith('__')))\n"
+        "print(__file__ == sys.argv[0] or __file__.endswith('prog.py'))\n"
+        "import pickle\n"
+        "class P: pass\n"
+        "print(type(pickle.loads(pickle.dumps(P()))).__name__)\n"
+    )
+    (tmp_path / "prog.py").write_text(probe, encoding="utf-8")
+    expected = python("prog.py", cwd=tmp_path).stdout
+    assert pyrust("run", "-q", "prog.py", cwd=tmp_path).stdout == expected
+
+
+def test_uncaught_exceptions_go_through_sys_excepthook(tmp_path: Path):
+    prog = (
+        f"{PYTHON_TIER}import sys\n"
+        "def hook(t, v, tb):\n    print('HOOK', t.__name__, v, tb.tb_frame.f_code.co_filename.endswith('e.py'))\n"
+        "sys.excepthook = hook\n"
+        "raise ValueError('boom')\n"
+    )
+    (tmp_path / "e.py").write_text(prog, encoding="utf-8")
+    expected = python("e.py", cwd=tmp_path)
+    res = pyrust("run", "-q", "e.py", cwd=tmp_path)
+    assert res.stdout == expected.stdout == "HOOK ValueError boom True\n"
+    assert res.returncode == expected.returncode == 1
+
+
+def test_syntax_error_in_cpython_tier_looks_like_python(tmp_path: Path):
+    (tmp_path / "s.py").write_text("x = (\n", encoding="utf-8")
+    expected = python("s.py", cwd=tmp_path)
+    res = pyrust("run", "-q", "s.py", cwd=tmp_path)
+    assert res.returncode == expected.returncode == 1
+    assert "Traceback" not in res.stderr
     assert res.stderr.strip().splitlines()[-1] == expected.stderr.strip().splitlines()[-1]
 
 
