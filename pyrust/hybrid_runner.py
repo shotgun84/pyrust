@@ -476,6 +476,10 @@ def _make_main_module(path: str, directory_entry: bool) -> types.ModuleType:
         mod.__package__ = ""
         mod.__spec__ = importlib.machinery.ModuleSpec("__main__", loader, origin=path)
     mod.__dict__["__builtins__"] = builtins
+    if sys.version_info < (3, 14):
+        # CPython 3.11-3.13 create `__annotations__` in __main__ up front
+        # (3.14 evaluates annotations lazily, PEP 649).
+        mod.__dict__["__annotations__"] = {}
     mod.__file__ = path
     cached = None
     if directory_entry and path.endswith(".py"):
@@ -530,8 +534,20 @@ def main(
     # Compile before the module reset below: decoding and instrumenting may
     # import stdlib modules, which must not resolve to the program's own files.
     code = syntax_error = None
+    source = _decode_source(data)
+    if isinstance(source, bytes):
+        # Undecodable source: CPython reports it while reading the file, with
+        # wording that differs from compile(). Nothing has run yet, so let the
+        # interpreter itself report it.
+        cmd = [sys.executable, script, *args]
+        sys.stdout.flush()
+        if os.name == "posix":
+            os.execv(sys.executable, cmd)
+        import subprocess
+
+        return subprocess.run(cmd, check=False).returncode
     try:
-        code = instrument(_decode_source(data), main_file, set(accel))
+        code = instrument(source, main_file, set(accel))
     except SyntaxError as exc:
         syntax_error = exc
 

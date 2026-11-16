@@ -181,13 +181,15 @@ def test_toolchain_identity_is_part_of_the_cache_key(tmp_path: Path):
 
 @needs_cargo
 def test_local_module_shadowing_a_native_stdlib_module_wins(tmp_path: Path):
-    (tmp_path / "prog.py").write_text("import math\nprint(math.sqrt(16))\n", encoding="utf-8")
+    # json is always a regular package (math can be compiled into the
+    # interpreter, in which case a local math.py never shadows it).
+    (tmp_path / "prog.py").write_text("import json\nprint(json.dumps(16))\n", encoding="utf-8")
     first = pyrust("run", "prog.py", cwd=tmp_path)
-    assert first.stdout == "4.0\n" and tier(first.stderr) == "native", first.stderr
-    # A local math.py appears: Python now imports it, and so must the cached plan.
-    (tmp_path / "math.py").write_text("def sqrt(x):\n    return 'local sqrt'\n", encoding="utf-8")
+    assert first.stdout == "16\n" and tier(first.stderr) == "native", first.stderr
+    # A local json.py appears: Python now imports it, and so must the cached plan.
+    (tmp_path / "json.py").write_text("def dumps(x):\n    return 'local dumps'\n", encoding="utf-8")
     expected = python("prog.py", cwd=tmp_path).stdout
-    assert expected == "local sqrt\n"
+    assert expected == "local dumps\n"
     for _ in range(2):
         res = pyrust("run", "prog.py", cwd=tmp_path)
         assert res.stdout == expected, res.stderr
