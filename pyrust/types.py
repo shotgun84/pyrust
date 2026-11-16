@@ -79,7 +79,7 @@ class TupleType(PyType):
         if not self.elements:
             return "()"
         inner = ", ".join(e.to_rust_type() for e in self.elements)
-        return f"({inner})"
+        return f"({inner},)" if len(self.elements) == 1 else f"({inner})"
 
 
 @dataclass(frozen=True)

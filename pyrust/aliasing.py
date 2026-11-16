@@ -263,10 +263,13 @@ class Summary:
     ret_from: set[str] = field(default_factory=set)  # params whose objects may be returned
     stores: set[tuple[str, str]] = field(default_factory=set)  # (src param, dst param): src stored into dst
     fresh_into: set[str] = field(default_factory=set)  # params that receive objects created by the callee
+    fresh_multi: bool = False  # a created object was stored in more than one place
+    ret_shared: set[str] = field(default_factory=set)  # params also holding (part of) the returned object
     rebinds: set[str] = field(default_factory=set)
 
     def key(self):
-        return (frozenset(self.writes), frozenset(self.ret_from), frozenset(self.stores), frozenset(self.fresh_into))
+        return (frozenset(self.writes), frozenset(self.ret_from), frozenset(self.stores),
+                frozenset(self.fresh_into), self.fresh_multi, frozenset(self.ret_shared))
 
 
 @dataclass
@@ -348,6 +351,8 @@ class _ScopeAnalyzer:
                     self.summary.stores.add((src, dst))
                 elif dst and src is None:
                     self.summary.fresh_into.add(dst)
+                    if o in st.multi:
+                        self.summary.fresh_multi = True
 
     @staticmethod
     def _param_of(o: Obj) -> str | None:
@@ -384,6 +389,16 @@ class _ScopeAnalyzer:
         for var, root in self.families:
             if writer in (var, root):
                 family |= {var, root}
+        for o in objs:
+            p = self._param_of(o)
+            if p is not None and p not in family:
+                # The caller sees this object through the parameter; only
+                # writes through the parameter itself (passed as &mut) reach it.
+                self.fail(
+                    node,
+                    f"modifying parameter '{p}' (or part of it) through another name "
+                    f"('{writer or 'an expression'}') is not supported natively",
+                )
         for name in self.live_now():
             if name in family or name not in st.env:
                 continue
@@ -691,13 +706,32 @@ class _ScopeAnalyzer:
             if dst in bound and bound[dst]:
                 child = self.alloc(st, ("fresh", id(node), dst))
                 self.store(st, bound[dst], {child}, node, existing=False)
+                if summ.fresh_multi:
+                    st.multi = st.multi | {child}
         out: set = set()
+        for p in summ.ret_from:
+            if p in bound:
+                # The result is (or contains) the caller's object: shared.
+                shared = st.reach(bound[p])
+                st.multi = st.multi | shared
+                out |= shared
         if alloc_result and is_mutable(self.t(node)):
             o = self.alloc(st, node)
             out.add(o)
+            # A new container may hold the caller's objects (`return [x]`).
+            held = set()
             for p in summ.ret_from:
                 if p in bound:
-                    out |= st.reach(bound[p])
+                    held |= st.reach(bound[p])
+            if held:
+                st.heap[o] = st.heap.get(o, frozenset()) | frozenset(held)
+            if summ.ret_shared:
+                # The callee also stored the returned object into an argument
+                # (e.g. a factory method appending to self): shared.
+                st.multi = st.multi | {o}
+                for p in summ.ret_shared:
+                    if p in bound:
+                        st.multi = st.multi | st.children(bound[p])
         return frozenset(out)
 
     # ---- statements -----------------------------------------------------
@@ -769,10 +803,15 @@ class _ScopeAnalyzer:
         if isinstance(s, ast.Return):
             objs = self.ev(s.value, st)
             if s.value is not None:
-                for o in st.reach(objs):
+                reach = st.reach(objs)
+                for o in reach:
                     p = self._param_of(o)
                     if p is not None:
                         self.summary.ret_from.add(p)
+                for p in self.params:
+                    held = st.reach(st.env.get(p, frozenset())) - {("param", p), ("pchild", p)}
+                    if held & reach:
+                        self.summary.ret_shared.add(p)
             return None
         if isinstance(s, ast.Raise):
             self.ev(s.exc, st)
@@ -918,6 +957,19 @@ class _ScopeAnalyzer:
     def _loop_writes_target(self, s: ast.For, var: str) -> bool:
         """Is the loop variable modified in place in the body?"""
         for node in ast.walk(ast.Module(body=s.body, type_ignores=[])):
+            if isinstance(node, ast.For) and node is not s:
+                inner = node.iter
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "enumerate" \
+                        and inner.args:
+                    inner = inner.args[0]
+                elif isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and \
+                        inner.func.attr in ("values", "items"):
+                    inner = inner.func.value
+                tgt = node.target
+                if isinstance(tgt, ast.Tuple) and len(tgt.elts) == 2:
+                    tgt = tgt.elts[1]
+                if self.root(inner) == var and isinstance(tgt, ast.Name) and self._loop_writes_target(node, tgt.id):
+                    return True
             targets: list[ast.expr] = []
             if isinstance(node, (ast.Assign, ast.Delete)):
                 targets = list(node.targets)

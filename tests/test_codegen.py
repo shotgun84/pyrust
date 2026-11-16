@@ -149,8 +149,8 @@ d = {"k": 10}
 d["k"] += 1
 """
     rust = transpile_source(src)
-    assert "py_set_index(&mut items, (-1), 99);" in rust
-    assert "py_set_index(&mut items, 0, (py_index(&items, 0) + 5));" in rust
+    assert 'let __si1 = (-1);\n    py_set_index(&mut items, __si1, __sv1);' in rust
+    assert "py_set_index(&mut items, __si2, __sv2);" in rust
     assert 'd.insert("k".to_string(), (d[&"k".to_string()].clone() + 1));' in rust
 
 
@@ -346,15 +346,15 @@ def test_walrus_assignment_expression():
 def test_boolop_or_and_yield_values_not_bools():
     src = 'user = ""\nname = user or "anon"\n'
     rust = transpile_source(src)
-    assert 'let name: String = if (!user.is_empty()) { user } else { "anon".to_string() };' in rust
+    assert 'let name: String = { let __bo1 = user; if (!__bo1.clone().is_empty()) { __bo1.clone() } else { "anon".to_string() } };' in rust
 
     src2 = "a = 0\nb = 5\nc = a or b\n"
     rust2 = transpile_source(src2)
-    assert "let c: i64 = if (a != 0) { a } else { b };" in rust2
+    assert 'let c: i64 = { let __bo1 = a; if (__bo1 != 0) { __bo1 } else { b } };' in rust2
 
     src3 = "x = 1\ny = 2\nz = x and y\n"
     rust3 = transpile_source(src3)
-    assert "let z: i64 = if (x != 0) { y } else { x };" in rust3
+    assert "let z: i64 = { let __bo1 = x; if (__bo1 != 0) { y } else { __bo1 } };" in rust3
 
 
 def test_dict_and_set_comprehensions():

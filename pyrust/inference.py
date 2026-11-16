@@ -614,7 +614,8 @@ class _TypeInferer:
                     dflt_t = self._infer_expr(dflt, self.env.module_scope, None)
                     ftype = ftype if ftype != UNKNOWN else dflt_t
                     dc_defaults.append(dflt)
-                fields[target.id] = unify_container_elem(fields.get(target.id, UNKNOWN), ftype)
+                cur = fields.get(target.id, UNKNOWN)
+                fields[target.id] = cur if cur != UNKNOWN else ftype
             self.env.class_types[cls.name] = ClassType(cls.name, fields, dict(methods))
 
         for item in cls.body:
@@ -1292,24 +1293,26 @@ class _TypeInferer:
 
         if isinstance(node.func, ast.Name):
             fname = node.func.id
+            # Built-ins (a function or class the program defines takes precedence)
+            bname = None if (fname in self.func_nodes or fname in self.class_nodes) else fname
             # Built-ins
-            if fname == "int":
+            if bname == "int":
                 return INT
-            if fname == "float":
+            if bname == "float":
                 return FLOAT
-            if fname == "str":
+            if bname == "str":
                 return STR
-            if fname == "bool":
+            if bname == "bool":
                 return BOOL
-            if fname == "len":
+            if bname == "len":
                 return INT
-            if fname == "range":
+            if bname == "range":
                 return ListType(INT)
-            if fname == "abs":
+            if bname == "abs":
                 if not arg_types:
                     return INT
                 return INT if arg_types[0] == BOOL else arg_types[0]
-            if fname == "sum":
+            if bname == "sum":
                 if not arg_types:
                     return INT
                 elem = self._iterable_element_type(arg_types[0])
@@ -1324,7 +1327,7 @@ class _TypeInferer:
                     return INT
                 # sum([]) is the int 0 even for a list of floats.
                 return ANY
-            if fname in ("min", "max"):
+            if bname in ("min", "max"):
                 if not arg_types:
                     return INT
                 first = arg_types[0]
@@ -1335,19 +1338,19 @@ class _TypeInferer:
                 for at in arg_types:
                     acc = unify_types(acc, at)
                 return acc if acc != UNKNOWN else INT
-            if fname == "sorted":
+            if bname == "sorted":
                 if arg_types:
                     return ListType(self._iterable_element_type(arg_types[0]))
                 return ListType(UNKNOWN)
-            if fname == "list":
+            if bname == "list":
                 if arg_types:
                     return ListType(self._iterable_element_type(arg_types[0]))
                 return ListType(UNKNOWN)
-            if fname == "set":
+            if bname == "set":
                 if arg_types:
                     return SetType(self._iterable_element_type(arg_types[0]))
                 return SetType(UNKNOWN)
-            if fname == "dict":
+            if bname == "dict":
                 if node.keywords and all(k.arg is not None for k in node.keywords):
                     for kw in node.keywords:
                         self._infer_expr(kw.value, scope, current_class)
@@ -1361,33 +1364,33 @@ class _TypeInferer:
                 if not node.args and not node.keywords:
                     return DictType(UNKNOWN, UNKNOWN)
                 return ANY
-            if fname == "enumerate":
+            if bname == "enumerate":
                 elem = self._iterable_element_type(arg_types[0]) if arg_types else ANY
                 return ListType(TupleType((INT, elem)))
-            if fname == "zip":
+            if bname == "zip":
                 elems = tuple(self._iterable_element_type(at) for at in arg_types)
                 return ListType(TupleType(elems))
-            if fname == "input":
+            if bname == "input":
                 return STR
-            if fname == "print":
+            if bname == "print":
                 return NONE
-            if fname == "divmod" and len(arg_types) == 2:
+            if bname == "divmod" and len(arg_types) == 2:
                 if arg_types[0] == FLOAT or arg_types[1] == FLOAT:
                     return TupleType((FLOAT, FLOAT))
                 return TupleType((INT, INT))
-            if fname == "round":
+            if bname == "round":
                 if len(arg_types) == 2:
                     return INT if arg_types[0] in (INT, BOOL) else FLOAT
                 return INT
-            if fname in ("all", "any"):
+            if bname in ("all", "any"):
                 return BOOL
-            if fname == "reversed" and arg_types:
+            if bname == "reversed" and arg_types:
                 return ListType(self._iterable_element_type(arg_types[0]))
-            if fname == "ord":
+            if bname == "ord":
                 return INT
-            if fname in ("chr", "hex", "oct", "bin"):
+            if bname in ("chr", "hex", "oct", "bin"):
                 return STR
-            if fname == "open":
+            if bname == "open":
                 return _pyfile_type()
 
             # `from X import name` aliases: resolve to the source module
@@ -1446,6 +1449,25 @@ class _TypeInferer:
                     return self.env.func_types[qual].ret
 
             # Class constructor call
+            if fname in self.env.class_types and fname in self.class_nodes and \
+                    _is_dataclass(self.class_nodes[fname]) and not any(
+                        isinstance(m, ast.FunctionDef) and m.name == "__init__" for m in self.class_nodes[fname].body):
+                # Synthetic dataclass __init__: fields take the arguments' types
+                # (annotations are not enforced at run time).
+                cls_type = self.env.class_types[fname]
+                names = self.env.func_param_names.get(f"{fname}.__init__", list(cls_type.fields))
+                fields = dict(cls_type.fields)
+                for fname_, at in list(zip(names, arg_types)) + [
+                    (kw.arg, self._infer_expr(kw.value, scope, current_class)) for kw in node.keywords if kw.arg
+                ]:
+                    if fname_ in fields:
+                        fields[fname_] = unify_types(fields[fname_], at)
+                if fields != cls_type.fields:
+                    methods = dict(cls_type.methods)
+                    if "__init__" in methods:
+                        methods["__init__"] = FuncType(params=[fields[n] for n in names if n in fields], ret=NONE)
+                    self.env.class_types[fname] = ClassType(cls_type.name, fields, methods)
+                return self.env.class_types[fname]
             if fname in self.env.class_types:
                 cls_type = self.env.class_types[fname]
                 if "__init__" in cls_type.methods:
