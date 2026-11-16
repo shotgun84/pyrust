@@ -1,0 +1,1 @@
+print("straße".upper())

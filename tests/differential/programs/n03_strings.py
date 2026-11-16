@@ -1,0 +1,16 @@
+s = "Hello, World"
+print(s.upper(), s.lower(), s[::-1], s[2:5], s[-3:], s[::2])
+print(s.split(", "), "a  b   c".split(), "a,b,,c".split(","))
+print("  pad  ".strip() + "|", "xxhixx".strip("x"))
+print("-".join(["a", "b", "c"]), "abc".replace("b", "BB"))
+print("hello".find("l"), "hello".find("z"), "hello".count("l"))
+print("hello".startswith("he"), "hello".endswith("lo"), "Hello world".capitalize())
+print("123".isdigit(), "abc".isalpha(), " ".isspace(), "".isdigit())
+print("line1\nline2\n".splitlines(), "x".removeprefix("x"), "ab".removesuffix("b"))
+print("é" * 3, len("héllo"), "héllo"[1], "héllo".upper())
+print("ß".upper(), "İ".lower() == "i̇")
+u = "日本語テキスト"
+print(u[2:4], len(u), u[::-1])
+print("a" < "b", "abc" < "abd", "Z" < "a", "" < "a")
+print("%5s|%-5s|" % ("ab", "cd"))
+print(str(12) + "3", "x" * 0, "ab" * -1)

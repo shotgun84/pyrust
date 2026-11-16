@@ -1,0 +1,1 @@
+print("aaaa".count("aa"))
