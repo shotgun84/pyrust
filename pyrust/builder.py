@@ -442,17 +442,63 @@ def run_project(
     return run_on_cpython(Path(recipe["script"]), args, manifest)
 
 
+# Folders that hold environments, dependencies, VCS data or caches, never the user's own sources.
+_MIGRATE_SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".venv", "venv", ".tox", ".nox", "__pycache__", ".pyrust_cache",
+    "site-packages", "dist-packages", "node_modules", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".eggs", "pyrust_vendor",
+}
+
+
+def _is_environment_dir(path: Path) -> bool:
+    return (
+        path.name in _MIGRATE_SKIP_DIRS
+        or path.name.endswith(".egg-info")
+        or (path / "pyvenv.cfg").exists()  # any virtual environment, whatever its name
+    )
+
+
+@dataclasses.dataclass
+class MigrationResult:
+    converted: list[Path]
+    skipped: list[tuple[Path, str]]  # (file, reason): left untouched
+
+
 def migrate_directory_to_pyr(directory: Path, copy_only: bool = True) -> list[Path]:
     """Convert `.py` files in a directory to `.pyr` files for drag-and-drop migration."""
+    return migrate_directory(directory, copy_only=copy_only).converted
+
+
+def migrate_directory(directory: Path, copy_only: bool = True) -> MigrationResult:
+    """Copy (or rename) each `.py` under `directory` to `.pyr`.
+
+    Existing `.pyr` files are never overwritten, environment/VCS/cache folders are
+    skipped, and `--rename` leaves packages (folders with `__init__.py`) alone,
+    since `.pyr` modules inside a package cannot be imported by plain Python.
+    """
     directory = Path(directory).resolve()
-    converted: list[Path] = []
-    for py_file in sorted(directory.rglob("*.py")):
-        if py_file.name == "__init__.py" or ".pyrust_cache" in py_file.parts:
-            continue
-        pyr_file = py_file.with_suffix(".pyr")
-        if copy_only:
-            shutil.copy2(py_file, pyr_file)
-        else:
-            py_file.rename(pyr_file)
-        converted.append(pyr_file)
-    return converted
+    if not directory.is_dir():
+        what = "is not a directory" if directory.exists() else "does not exist"
+        raise PyRustError(f"Cannot migrate {directory}: it {what}")
+    result = MigrationResult([], [])
+    for root, dirs, files in os.walk(directory):
+        root_path = Path(root)
+        dirs[:] = sorted(d for d in dirs if not _is_environment_dir(root_path / d))
+        in_package = (root_path / "__init__.py").exists()
+        for name in sorted(files):
+            if not name.endswith(".py") or name == "__init__.py":
+                continue
+            py_file = root_path / name
+            pyr_file = py_file.with_suffix(".pyr")
+            if pyr_file.exists():
+                result.skipped.append((py_file, f"{pyr_file.name} already exists"))
+                continue
+            if not copy_only and in_package:
+                result.skipped.append((py_file, "inside a package; renaming would break `import`"))
+                continue
+            if copy_only:
+                shutil.copy2(py_file, pyr_file)
+            else:
+                py_file.rename(pyr_file)
+            result.converted.append(pyr_file)
+    return result

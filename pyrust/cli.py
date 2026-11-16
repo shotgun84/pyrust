@@ -165,8 +165,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if ns.command == "migrate":
-            converted = builder.migrate_directory_to_pyr(ns.directory, copy_only=not ns.rename)
-            print(f"Migrated {len(converted)} file(s) to .pyr")
+            result = builder.migrate_directory(ns.directory, copy_only=not ns.rename)
+            print(f"Migrated {len(result.converted)} file(s) to .pyr")
+            if result.skipped:
+                print(f"Skipped {len(result.skipped)} file(s):")
+                for path, reason in result.skipped:
+                    print(f"  {path}: {reason}")
             return 0
 
     except PyRustError as exc:
