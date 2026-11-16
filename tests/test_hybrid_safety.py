@@ -231,6 +231,18 @@ def test_fast_path_only_for_exact_types():
     assert lib.calls[-1] == ("tri", 5, 10)
 
 
+def test_guard_ignores_parameters_and_globals_named_like_builtins():
+    src = (
+        "int = 'shadowed'\n"
+        "def f(type, KeyError):\n    t = 0\n    for i in range(type):\n        t += KeyError\n    return t\n"
+    )
+    lib = FakeLib()
+    ns = accelerate(src, {"f": (no_deps(builtins=["range"]), [(["int", "int"], "int", lambda a, b: a * b)])}, lib)
+    assert ns["f"](3, 4) == 12 and lib.calls == [("f", 3, 4)]
+    ns["range"] = range  # a global shadowing a builtin dependency (even with the same object)
+    assert ns["f"](3, 4) == 12 and len(lib.calls) == 1
+
+
 def test_bail_out_runs_the_python_body():
     lib = FakeLib()
     ns = accelerate(LOOP, {"tri": (no_deps(builtins=["range"]), [(["int", "int"], "int", tri_native)])}, lib)

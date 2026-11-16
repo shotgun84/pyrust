@@ -13,9 +13,10 @@ import sys
 import types
 
 _GUARD = {
-    "int": "type({a}) is int and -9223372036854775808 <= {a} <= 9223372036854775807",
-    "float": "type({a}) is float",
-    "bool": "type({a}) is bool",
+    # Closure cells, not builtins: a parameter or global named `type`/`int`/... must not matter.
+    "int": "__pyr_type({a}) is __pyr_int and -9223372036854775808 <= {a} <= 9223372036854775807",
+    "float": "__pyr_type({a}) is __pyr_float",
+    "bool": "__pyr_type({a}) is __pyr_bool",
 }
 
 # How each return type tells "native result" from "native code bailed out".
@@ -286,7 +287,9 @@ def _wrap(orig, spec: dict, calls: list, ctx: _Context):
         bind("__pyr_err", ctx.take_error)
     guard_src = "\n".join(lines)
     if terms:  # a missing global raises KeyError in the check: run the original
-        guard_src = "try:\n" + "\n".join("    " + line for line in lines) + "\nexcept KeyError:\n    pass"
+        guard_src = "try:\n" + "\n".join("    " + line for line in lines) + "\nexcept __pyr_KeyError:\n    pass"
+    for builtin_name in ("type", "int", "float", "bool", "KeyError"):
+        bind(f"__pyr_{builtin_name}", ctx.builtins[builtin_name])
 
     lineno = code.co_firstlineno
     node = _DEFS.pop((code.co_filename, name), None)
