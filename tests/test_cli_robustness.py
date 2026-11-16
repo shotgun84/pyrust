@@ -532,7 +532,11 @@ def test_native_crash_status_is_not_truncated(tmp_path: Path):
     res = pyrust("run", "deep.py", cwd=tmp_path)
     if tier(res.stderr) != "native":
         pytest.skip("program did not compile natively")
-    assert res.returncode < 0  # died by a signal, like the binary itself (not 250 / 245)
+    # Native code enforces CPython's recursion limit, so the program ends the
+    # way CPython's does: a RecursionError traceback and exit status 1 (not a
+    # stack-overflow signal, and not a truncated status like 250 / 245).
+    assert res.returncode == 1
+    assert res.stderr.strip().splitlines()[-1] == "RecursionError: maximum recursion depth exceeded"
 
 
 @pytest.mark.parametrize("prefix", ["", PYTHON_TIER])

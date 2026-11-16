@@ -141,6 +141,10 @@ class ModuleTypeEnv:
     # keyed by function name (or "Cls.method" / "mod.func" for qualified).
     func_param_names: dict[str, list[str]] = field(default_factory=dict)
     func_defaults: dict[str, list[ast.expr]] = field(default_factory=dict)
+    # Module-level numeric/bool constants this module exports (bound once to
+    # a literal), and those of imported modules keyed "mod.NAME".
+    const_types: dict[str, PyType] = field(default_factory=dict)
+    imported_consts: dict[str, PyType] = field(default_factory=dict)
 
 
 def parse_annotation(node: ast.expr | None, class_types: dict[str, ClassType] | None = None) -> PyType:
@@ -298,6 +302,20 @@ class _TypeInferer:
                 self._infer_function(fn)
             self._infer_stmts(self.parsed.main_body, self.env.module_scope, current_class=None)
 
+        counts: dict[str, int] = {}
+        for node in ast.walk(ast.Module(body=self.parsed.main_body, type_ignores=[])):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                counts[node.id] = counts.get(node.id, 0) + 1
+        for stmt in self.parsed.main_body:
+            tgt = stmt.targets[0] if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 else (
+                stmt.target if isinstance(stmt, ast.AnnAssign) else None
+            )
+            val = getattr(stmt, "value", None)
+            if isinstance(tgt, ast.Name) and isinstance(val, ast.Constant) and counts.get(tgt.id) == 1 \
+                    and isinstance(val.value, (int, float, bool)):
+                t = self.env.module_scope.var_types.get(tgt.id)
+                if t in (INT, FLOAT, BOOL):
+                    self.env.const_types[tgt.id] = t
         return self.env
 
     def _finalize_unknown_params(self) -> None:
@@ -1077,6 +1095,8 @@ class _TypeInferer:
             alias_mod = self.parsed.from_imports.get(node.id)
             if alias_mod == "math" and node.id in MATH_CONSTS:
                 return FLOAT
+            if alias_mod is not None and f"{alias_mod}.{node.id}" in self.env.imported_consts:
+                return self.env.imported_consts[f"{alias_mod}.{node.id}"]
             if alias_mod == "sys" and node.id == "argv":
                 return ListType(STR)
             return UNKNOWN
@@ -1235,6 +1255,9 @@ class _TypeInferer:
                     return ListType(STR)
                 if node.attr == "platform":
                     return STR
+            if isinstance(node.value, ast.Name) and node.value.id in self.parsed.imports \
+                    and f"{node.value.id}.{node.attr}" in self.env.imported_consts:
+                return self.env.imported_consts[f"{node.value.id}.{node.attr}"]
             obj_t = self._infer_expr(node.value, scope, current_class)
             if isinstance(obj_t, ClassType):
                 latest = self.env.class_types.get(obj_t.name, obj_t)

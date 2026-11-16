@@ -148,7 +148,10 @@ def test_unhinted_signature_is_a_reported_guess():
     )
     plan = plan_hybrid(src, "x.py")
     (total,) = plan.functions
-    assert [v.params for v in total.variants] == [["int"], ["float"]]
+    # Only the int variant is exportable: for a float n, `t = 0` makes the
+    # result an int on one path and a float on another (dynamic), which a
+    # native float-returning export could not reproduce.
+    assert [v.params for v in total.variants] == [["int"]]
     assert "guessed" in plan.notes["total"]
 
 

@@ -105,21 +105,33 @@ class _RustGenerator:
         consts: list[tuple[str, PyType, str]] = []
         scope = self.env.module_scope
         plan = self.ownership.get("__main__", OwnershipPlan())
+        assigned: dict[str, int] = {}
+        for node in ast.walk(ast.Module(body=self.parsed.main_body, type_ignores=[])):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                assigned[node.id] = assigned.get(node.id, 0) + 1
         for stmt in self.parsed.main_body:
+            target = value = None
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target, value = stmt.targets[0], stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                target, value = stmt.target, stmt.value
             if (
-                isinstance(stmt, ast.Assign)
-                and len(stmt.targets) == 1
-                and isinstance(stmt.targets[0], ast.Name)
-                and isinstance(stmt.value, ast.Constant)
-                and isinstance(stmt.value.value, (int, float, bool))
+                isinstance(target, ast.Name)
+                and isinstance(value, ast.Constant)
+                and isinstance(value.value, (int, float, bool))
             ):
-                name = stmt.targets[0].id
-                vtype = scope.var_types.get(name, UNKNOWN)
+                name = target.id
+                vtype = scope.expr_types.get(id(value), scope.var_types.get(name, UNKNOWN))
+                # Imported modules export every constant (`helper.CONST`).
+                wanted = name in referenced_in_funcs or not self.is_entry
                 if (
-                    name in referenced_in_funcs
+                    wanted
+                    and assigned.get(name, 0) == 1
                     and name not in plan.mutable_vars
                     and vtype in (INT, FLOAT, BOOL)
+                    and scope.var_types.get(name, vtype) == vtype
                 ):
+                    stmt = ast.Assign(targets=[target], value=value)
                     code = self._expr(stmt.value, scope, plan, expected_type=vtype)
                     consts.append((name, vtype, code))
                     self.module_consts.add(name)
@@ -843,6 +855,8 @@ class _RustGenerator:
             return
 
         if isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name) and stmt.target.id in self.module_consts and not self.in_function:
+                return
             if stmt.value is not None:
                 self._emit_assignment(stmt.target, stmt.value, scope, plan, declared)
             return
@@ -2210,6 +2224,9 @@ class _RustGenerator:
                 return MATH_CONST_RUST[node.id]
             if self.parsed.from_imports.get(node.id) == "sys" and node.id == "argv":
                 return "std::env::args().collect::<Vec<String>>()"
+            src_mod = self.parsed.from_imports.get(node.id)
+            if src_mod is not None and f"{src_mod}.{node.id}" in self.env.imported_consts:
+                return f"crate::{src_mod}::{node.id}"
             if (
                 self.in_function
                 and node.id not in self._fn_locals
@@ -2258,7 +2275,15 @@ class _RustGenerator:
                 and node.value.id not in scope.var_types
                 and node.value.id not in self.env.module_scope.var_types
             ):
-                    return f"crate::{node.value.id}::{node.attr}"
+                if f"{node.value.id}.{node.attr}" not in self.env.imported_consts:
+                    raise PyRustError(
+                        f"module attribute '{node.value.id}.{node.attr}' is not supported natively "
+                        "(only functions, classes and numeric constants of imported modules are)",
+                        lineno=getattr(node, "lineno", None),
+                        col=getattr(node, "col_offset", None),
+                        filename=self.parsed.filename,
+                    )
+                return f"crate::{node.value.id}::{node.attr}"
             recv_t = scope.expr_types.get(id(node.value), UNKNOWN)
             if isinstance(recv_t, ClassType):
                 latest = self.env.class_types.get(recv_t.name, recv_t)
@@ -3283,7 +3308,7 @@ class _RustGenerator:
                 arg_node = pos_args[i] if i < len(pos_args) else kw_map.get(pname)
                 if arg_node is None:
                     di = i - (n_fixed - len(defaults))
-                    out.append(f"&mut {self._expr(defaults[di], scope, plan, expected_type=ptype)}")
+                    out.append(f"&mut {self._default_code(defaults[di], ptype, node)}")
                 elif isinstance(arg_node, (ast.Name, ast.Attribute, ast.Subscript)) and self._root_of(arg_node):
                     pre: list[str] = []
                     place = self._place(arg_node, scope, plan, pre)
@@ -3305,7 +3330,7 @@ class _RustGenerator:
             else:
                 di = i - (n_fixed - len(defaults))
                 if 0 <= di < len(defaults):
-                    out.append(self._expr(defaults[di], scope, plan, expected_type=ptype))
+                    out.append(self._default_code(defaults[di], ptype, node))
                 else:
                     raise PyRustError(
                         f"missing required argument '{pname or 'arg%d' % i}'",
@@ -3422,6 +3447,41 @@ class _RustGenerator:
             method = "starts_with" if attr == "startswith" else "ends_with"
             return f"{recv}.{method}({s_arg(0)}.as_str())"
         raise err(f"method '{attr}' is not supported on str by PyRust yet")
+
+    def _default_code(self, default: ast.expr, ptype: PyType | None, call: ast.AST) -> str:
+        """A default argument value at a call site. Python evaluates defaults
+        once, when the function is defined: only values for which evaluating
+        per call is indistinguishable (constants, tuples of them) are native."""
+        def simple(n: ast.expr) -> bool:
+            if isinstance(n, ast.Constant):
+                return True
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
+                return simple(n.operand)
+            if isinstance(n, ast.Tuple):
+                return all(simple(e) for e in n.elts)
+            if isinstance(n, (ast.List, ast.Dict, ast.Set)) and not getattr(n, "elts", None) and not getattr(n, "keys", None):
+                return True  # fresh empty container: sharing was ruled out by the alias analysis
+            return False
+
+        if not simple(default):
+            raise PyRustError(
+                "a default argument value that is not a constant is not supported natively "
+                "(Python evaluates it once, at definition time)",
+                lineno=getattr(default, "lineno", None),
+                col=getattr(default, "col_offset", None),
+                filename=self.parsed.filename,
+            )
+        tmp_scope = ScopeInfo()
+        from pyrust.inference import _TypeInferer
+
+        inf = _TypeInferer.__new__(_TypeInferer)
+        inf.parsed = self.parsed
+        inf.env = self.env
+        try:
+            inf._infer_expr(default, tmp_scope, None)
+        except Exception:
+            pass
+        return self._expr(default, tmp_scope, OwnershipPlan(), expected_type=ptype)
 
     def _call_expr(self, node: ast.Call, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         if isinstance(node.func, ast.Name):

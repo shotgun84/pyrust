@@ -220,6 +220,8 @@ def emit_cargo_project(target_path: Path, output_dir: Path | None = None) -> Pat
                         fresh_inf.env.func_param_names[f"{imp_name}.{key}"] = list(names)
                     for key, dflts in envs[imp_name].func_defaults.items():
                         fresh_inf.env.func_defaults[f"{imp_name}.{key}"] = list(dflts)
+                    for cname, ctype in envs[imp_name].const_types.items():
+                        fresh_inf.env.imported_consts[f"{imp_name}.{cname}"] = ctype
             if mod.name in envs:
                 fresh_inf.env.func_types.update(envs[mod.name].func_types)
             envs[mod.name] = fresh_inf.run()
