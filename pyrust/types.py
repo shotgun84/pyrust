@@ -159,11 +159,10 @@ def unify_types(t1: PyType | None, t2: PyType | None) -> PyType:
     if t1 == ANY or t2 == ANY:
         return ANY
 
-    # Numeric promotions: bool -> int -> float
-    numeric_order = {BOOL: 0, INT: 1, FLOAT: 2}
-    if isinstance(t1, PrimitiveType) and isinstance(t2, PrimitiveType):
-        if t1 in numeric_order and t2 in numeric_order:
-            return t1 if numeric_order[t1] >= numeric_order[t2] else t2
+    # No numeric promotion here: a variable/parameter/result that is an int on
+    # one path and a float (or bool) on another keeps its runtime type in
+    # Python (`0` prints as `0`, not `0.0`), so it must stay dynamic. Mixed
+    # *arithmetic* is typed separately (see `arith_result_type`).
 
     # Containers unify recursively (bool is preserved by unify_container_elem).
     if isinstance(t1, ListType) and isinstance(t2, ListType):
@@ -209,3 +208,28 @@ def type_from_annotation_name(name: str) -> PyType:
         "set": SetType(UNKNOWN),
     }
     return mapping.get(name, UNKNOWN)
+
+
+def arith_result_type(op_name: str, left: PyType, right: PyType) -> PyType | None:
+    """Result type of a numeric binary operator, or None if not numeric.
+
+    Mirrors Python: bool behaves as int in arithmetic (True + True == 2),
+    except for &, |, ^ between two bools, which stay bool; anything mixed
+    with a float is a float; `/` always yields a float.
+    """
+    nums = (BOOL, INT, FLOAT)
+    if left not in nums or right not in nums:
+        return None
+    if op_name == "Div":
+        return FLOAT
+    if op_name in ("BitAnd", "BitOr", "BitXor"):
+        if left == BOOL and right == BOOL:
+            return BOOL
+        if FLOAT in (left, right):
+            return None  # TypeError in Python
+        return INT
+    if op_name in ("LShift", "RShift"):
+        return None if FLOAT in (left, right) else INT
+    if FLOAT in (left, right):
+        return FLOAT
+    return INT

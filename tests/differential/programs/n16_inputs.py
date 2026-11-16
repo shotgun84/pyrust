@@ -1,8 +1,4 @@
-# pyrust: stdin=3
-10
--4
-7
-Ada
+# pyrust: stdin=3\n10\n-4\n7\nAda\n
 
 n = int(input())
 xs = []

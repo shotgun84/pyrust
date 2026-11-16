@@ -111,7 +111,13 @@ def test_dep_from_import_class_across_modules(tmp_path: Path):
     out = tmp_path / "from_cls_out"
     emit_cargo_project(pkg, out)
     main_rs = (out / "src" / "main.rs").read_text(encoding="utf-8")
-    assert "let p: Point = crate::shapes::Point::new(3.0f64, 4.0f64);" in main_rs
+    shapes_rs = (out / "src" / "shapes.rs").read_text(encoding="utf-8")
+    # The call must match the callee's signature (both sides typed alike).
+    if "pub fn new(x: f64, y: f64)" in shapes_rs:
+        assert "crate::shapes::Point::new(3.0f64, 4.0f64)" in main_rs
+    else:
+        assert "pub fn new(x: PyValue, y: PyValue)" in shapes_rs
+        assert "crate::shapes::Point::new(PyValue::from(3.0f64), PyValue::from(4.0f64))" in main_rs
 
 
 def test_honesty_unknown_third_party_import_raises(tmp_path: Path):

@@ -47,10 +47,22 @@ def test_unify_identical_and_unknown_types():
     assert unify_types(STR, STR) == STR
 
 
-def test_unify_numeric_promotion():
-    assert unify_types(INT, FLOAT) == FLOAT
-    assert unify_types(FLOAT, INT) == FLOAT
-    assert unify_types(BOOL, INT) == INT
+def test_unify_numeric_kinds_stay_dynamic():
+    # A value that is an int on one path and a float on another keeps its own
+    # type in Python (`0` prints as `0`), so merging must not promote.
+    assert unify_types(INT, FLOAT) == ANY
+    assert unify_types(FLOAT, INT) == ANY
+    assert unify_types(BOOL, INT) == ANY
+
+
+def test_arith_result_type_follows_python():
+    from pyrust.types import arith_result_type
+
+    assert arith_result_type("Add", INT, FLOAT) == FLOAT
+    assert arith_result_type("Add", BOOL, BOOL) == INT
+    assert arith_result_type("BitAnd", BOOL, BOOL) == BOOL
+    assert arith_result_type("Div", INT, INT) == FLOAT
+    assert arith_result_type("BitOr", INT, FLOAT) is None
 
 
 def test_unify_incompatible_types_promotes_to_pyvalue():

@@ -14,7 +14,8 @@ from pyrust.inference import (
     _positional_params,
     infer_module,
 )
-from pyrust.ownership import OwnershipPlan, analyze_ownership
+from pyrust.aliasing import AliasInfo, analyze_aliasing, is_mutable
+from pyrust.ownership import MUTATING_METHODS, OwnershipPlan, analyze_ownership
 from pyrust.parser import IGNORED_IMPORTS, ParsedModule, parse_source
 from pyrust.types import (
     ANY,
@@ -76,6 +77,12 @@ class _RustGenerator:
         self._else_stack: list[str | None] = []
         self._loop_counter = 0
         self.in_function = False
+        self._fn_locals: set[str] = set()
+        self.alias = AliasInfo()
+        self._ref_names: set[str] = set()  # names bound to `&mut T` (ref params, by-ref loop vars)
+        self._fn_key: str | None = None
+        self._place_override: str | None = None
+        self._mut_methods_cache: dict[str, set[str]] | None = None
 
     def emit(self, line: str = "") -> None:
         if line:
@@ -119,7 +126,19 @@ class _RustGenerator:
         return consts
 
     def generate(self) -> str:
-        self.emit("#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_snake_case)]")
+        from pyrust.definite import check_function, check_module
+
+        for fn in self.parsed.functions:
+            check_function(fn, self.parsed.filename)
+        for cls in self.parsed.classes:
+            for item in cls.body:
+                if isinstance(item, ast.FunctionDef):
+                    check_function(item, self.parsed.filename)
+        if self.is_entry:
+            check_module(self.parsed.tree, self.parsed.filename)
+        self.alias = analyze_aliasing(self.parsed, self.env, include_main=self.is_entry)
+        self._augment_mutability()
+        self.emit("#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_snake_case, unused_parens, arithmetic_overflow, unconditional_panic)]")
         if self.is_entry:
             self.emit("mod pyrust_rt;")
             declared: set[str] = set()
@@ -140,6 +159,9 @@ class _RustGenerator:
                 if imp not in ("math", "sys", "time", "random", "os", "typing", "json", "platform", "statistics", "gc"):
                     self.emit(f"mod {imp};")
         self.emit("use crate::pyrust_rt::*;")
+        if not self.is_entry:
+            # #[macro_export] macros live at the crate root; submodules import them.
+            self.emit("use crate::{py_print, py_println};")
         self.emit("use std::collections::HashSet;")
         self.emit()
 
@@ -158,6 +180,10 @@ class _RustGenerator:
 
         if self.is_entry:
             self.emit("fn main() {")
+            self.emit(f"    py_run_main(py_module_main, {self._replay_info()});")
+            self.emit("}")
+            self.emit()
+            self.emit("fn py_module_main() {")
             self.indent += 1
             scope = self.env.module_scope
             plan = self.ownership.get("__main__", OwnershipPlan())
@@ -168,6 +194,23 @@ class _RustGenerator:
             self.emit("}")
 
         return "\n".join(self.lines) + "\n"
+
+    def _replay_info(self) -> str:
+        """(python, script, pyrust package parent) for replaying on CPython."""
+        import os
+        import sys as _sys
+
+        import pyrust
+
+        path = getattr(self.parsed, "path", None)
+        if not path or not _sys.executable:
+            return "None"
+        pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(pyrust.__file__)))
+
+        def lit(x: str) -> str:
+            return self._rust_str_lit(str(x))
+
+        return f"Some(({lit(_sys.executable)}, {lit(os.path.abspath(str(path)))}, {lit(pkg_parent)}))"
 
     def _emit_hoisted_declarations(
         self,
@@ -236,6 +279,38 @@ class _RustGenerator:
                 emitted.add(mname)
         self.indent -= 1
         self.emit("}")
+        if cls_node.name in self._dataclass_names():
+            fields = self._dataclass_field_names(cls_node)
+            renames = getattr(self.parsed, "rust_renames", {}) or {}
+            parts = ", ".join(f"{renames.get(f, f)}={{}}" for f in fields)
+            args = "".join(f", self.{f}.py_repr()" for f in fields)
+            self.emit()
+            shown = renames.get(cls_node.name, cls_node.name)
+            self.emit(f"impl PyRepr for {cls_node.name} {{")
+            self.emit(f'    fn py_repr(&self) -> String {{ format!("{shown}({parts})"{args}) }}')
+            self.emit("}")
+
+    def _dataclass_field_names(self, cls_node: ast.ClassDef) -> list[str]:
+        names: list[str] = []
+        if cls_node.bases and isinstance(cls_node.bases[0], ast.Name):
+            base = next((c for c in self.parsed.classes if c.name == cls_node.bases[0].id), None)
+            if base is not None and base.name in self._dataclass_names():
+                names = self._dataclass_field_names(base)
+        for item in cls_node.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                ann = ast.unparse(item.annotation)
+                if "ClassVar" in ann:
+                    continue
+                if isinstance(item.value, ast.Call) and any(kw.arg == "repr" for kw in item.value.keywords):
+                    raise PyRustError(
+                        "dataclass field(repr=...) is not supported natively",
+                        lineno=item.lineno,
+                        col=item.col_offset,
+                        filename=self.parsed.filename,
+                    )
+                if item.target.id not in names:
+                    names.append(item.target.id)
+        return names
 
     def _find_method_def(
         self, cls_node: ast.ClassDef, method_name: str, _seen: set[str] | None = None
@@ -274,6 +349,7 @@ class _RustGenerator:
         ]
         self.emit(f"pub fn new({', '.join(param_strs)}) -> Self {{")
         self.indent += 1
+        self.emit("let _py_frame = PyFrame::enter();")
         self.emit(f"{cls_name} {{")
         self.indent += 1
         for fname in cls_type.fields:
@@ -305,7 +381,9 @@ class _RustGenerator:
         pos = _positional_params(fn_node)
         if skip_self:
             pos = [a for a in pos if a.arg != "self"]
+        refs = self.alias.ref_params.get(self._fn_key or "", set())
         strs = [
+            f"{a.arg}: &mut {pt.to_rust_type()}" if a.arg in refs else
             f"{('mut ' if a.arg in plan.mutable_vars else '')}{a.arg}: {pt.to_rust_type()}"
             for a, pt in zip(pos, ft.params)
         ]
@@ -348,10 +426,17 @@ class _RustGenerator:
 
     def _emit_class_init(self, cls_name: str, fn_node: ast.FunctionDef, cls_type: ClassType) -> None:
         prev_in_function, self.in_function = self.in_function, True
+        prev_locals, self._fn_locals = self._fn_locals, self._locals_of(fn_node)
+        key = f"{self._defining_class(cls_name, fn_node)}.{fn_node.name}"
+        prev_key, self._fn_key = self._fn_key, key
+        prev_refs, self._ref_names = self._ref_names, set(self.alias.ref_params.get(key, set()))
         try:
             self._emit_class_init_body(cls_name, fn_node, cls_type)
         finally:
             self.in_function = prev_in_function
+            self._fn_locals = prev_locals
+            self._fn_key = prev_key
+            self._ref_names = prev_refs
 
     def _emit_class_init_body(self, cls_name: str, fn_node: ast.FunctionDef, cls_type: ClassType) -> None:
         scope = self.env.class_method_scopes[(cls_name, "__init__")]
@@ -361,6 +446,7 @@ class _RustGenerator:
         param_strs = self._def_param_strs(fn_node, init_ft, plan, skip_self=True)
         self.emit(f"pub fn new({', '.join(param_strs)}) -> Self {{")
         self.indent += 1
+        self.emit("let _py_frame = PyFrame::enter();")
 
         simple_only = all(
             isinstance(stmt, ast.Assign)
@@ -397,7 +483,54 @@ class _RustGenerator:
         self.indent -= 1
         self.emit("}")
 
+    def _called_names(self) -> set[str]:
+        if not hasattr(self, "_called_cache"):
+            names: set[str] = set()
+            base_refs = {id(b) for c in ast.walk(self.parsed.tree) if isinstance(c, ast.ClassDef) for b in c.bases}
+            for node in ast.walk(self.parsed.tree):
+                if id(node) in base_refs:
+                    continue  # `class B(A)` does not instantiate A
+                if isinstance(node, ast.Call):
+                    f = node.func
+                    if isinstance(f, ast.Name):
+                        names.add(f.id)
+                    elif isinstance(f, ast.Attribute):
+                        names.add(f.attr)
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    names.add(node.id)  # passed around as a value: assume reachable
+            self._called_cache = names
+        return self._called_cache
+
+    def _emit_or_stub(self, emit, signature: str, reachable: bool) -> None:
+        """Emit a function; if it cannot be compiled but is provably never
+        called, emit a stub that fails loudly instead of blocking the program."""
+        mark, indent = len(self.lines), self.indent
+        try:
+            emit()
+        except PyRustError:
+            if reachable:
+                raise
+            del self.lines[mark:]
+            self.indent = indent
+            self.emit(signature + " {")
+            self.emit('    py_unsupported("calling a function PyRust could not compile")')
+            self.emit("}")
+
     def _emit_class_method(self, cls_name: str, fn_node: ast.FunctionDef, cls_type: ClassType) -> None:
+        reachable = cls_name in self._called_names() and fn_node.name in self._called_names()
+        sig = self._stub_signature(cls_name, fn_node, cls_type)
+        self._emit_or_stub(lambda: self._emit_class_method_checked(cls_name, fn_node, cls_type), sig, reachable)
+
+    def _stub_signature(self, cls_name: str, fn_node: ast.FunctionDef, cls_type: ClassType) -> str:
+        m_ft = cls_type.methods.get(fn_node.name)
+        if m_ft is None:
+            return f"pub fn {fn_node.name}(&self)"
+        params = [a for a in _positional_params(fn_node) if a.arg != "self"]
+        ps = ", ".join(f"_{a.arg}: {t.to_rust_type()}" for a, t in zip(params, m_ft.params))
+        ret = f" -> {m_ft.ret.to_rust_type()}" if m_ft.ret != NONE else ""
+        return f"pub fn {fn_node.name}(&self{', ' if ps else ''}{ps}){ret}"
+
+    def _emit_class_method_checked(self, cls_name: str, fn_node: ast.FunctionDef, cls_type: ClassType) -> None:
         self._check_fn_decorators(fn_node, f"method {cls_name}.{fn_node.name}")
         if fn_node.name.startswith("__") and fn_node.name.endswith("__"):
             # Python calls these implicitly (print, ==, len, ...). Emitting them
@@ -410,10 +543,17 @@ class _RustGenerator:
                 filename=self.parsed.filename,
             )
         prev_in_function, self.in_function = self.in_function, True
+        prev_locals, self._fn_locals = self._fn_locals, self._locals_of(fn_node)
+        key = f"{self._defining_class(cls_name, fn_node)}.{fn_node.name}"
+        prev_key, self._fn_key = self._fn_key, key
+        prev_refs, self._ref_names = self._ref_names, set(self.alias.ref_params.get(key, set()))
         try:
             self._emit_class_method_body(cls_name, fn_node, cls_type)
         finally:
             self.in_function = prev_in_function
+            self._fn_locals = prev_locals
+            self._fn_key = prev_key
+            self._ref_names = prev_refs
 
     def _emit_class_method_body(self, cls_name: str, fn_node: ast.FunctionDef, cls_type: ClassType) -> None:
         scope = self.env.class_method_scopes[(cls_name, fn_node.name)]
@@ -427,19 +567,187 @@ class _RustGenerator:
         ret_str = f" -> {m_ft.ret.to_rust_type()}" if m_ft.ret != NONE else ""
         self.emit(f"pub fn {fn_node.name}({', '.join(param_strs)}){ret_str} {{")
         self.indent += 1
+        self.emit("let _py_frame = PyFrame::enter();")
         declared = set(self._all_param_names(fn_node))
         self._emit_hoisted_declarations(scope, plan, declared)
         self._emit_block(fn_node.body, scope, plan, declared, current_class=cls_name, expected_ret=m_ft.ret)
         self.indent -= 1
         self.emit("}")
 
+    def alias_mut_methods(self) -> dict[str, set[str]]:
+        if self._mut_methods_cache is None:
+            from pyrust.ownership import mutating_methods
+
+            self._mut_methods_cache = mutating_methods(self.parsed)
+        return self._mut_methods_cache
+
+    def _defining_class(self, cls_name: str, fn_node: ast.FunctionDef) -> str:
+        for c in self.parsed.classes:
+            if any(item is fn_node for item in c.body):
+                return c.name
+        return cls_name
+
+    def _alias_key(self, call_key: str) -> str:
+        """Map a call key (`f`, `Cls.m`, `Cls.__init__`) to the key of the
+        function that defines it (methods may be inherited)."""
+        if "." not in call_key:
+            return call_key
+        cls, m = call_key.split(".", 1)
+        from pyrust.inference import _find_method_node_in
+
+        found = _find_method_node_in({c.name: c for c in self.parsed.classes}, cls, m)
+        return f"{found[0]}.{m}" if found else call_key
+
+    def _augment_mutability(self) -> None:
+        """Names that are iterated by reference or passed as `&mut` must be
+        declared `mut` in their scope."""
+        def scan(stmts: list[ast.stmt], plan: OwnershipPlan, scope: ScopeInfo) -> None:
+            for node in ast.walk(ast.Module(body=stmts, type_ignores=[])):
+                if isinstance(node, ast.For) and id(node) in self.alias.byref_loops:
+                    it = node.iter
+                    if isinstance(it, ast.Call) and isinstance(it.func, ast.Name):
+                        it = it.args[0]
+                    elif isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute):
+                        it = it.func.value
+                    r = self._root_of(it)
+                    if r:
+                        plan.mutable_vars.add(r)
+                if isinstance(node, ast.Call):
+                    key = self._call_alias_key(node, scope)
+                    refs = self.alias.ref_params.get(key, set()) if key else set()
+                    if not refs:
+                        continue
+                    from pyrust.inference import _positional_params as pp
+
+                    fn = self._fn_node_for(key)
+                    names = [a.arg for a in pp(fn)] if fn else []
+                    if names and names[0] == "self":
+                        names = names[1:]
+                    for pname, a in zip(names, node.args):
+                        if pname in refs and self._root_of(a):
+                            plan.mutable_vars.add(self._root_of(a))
+                    for kw in node.keywords:
+                        if kw.arg in refs and self._root_of(kw.value):
+                            plan.mutable_vars.add(self._root_of(kw.value))
+
+        scan(self.parsed.main_body, self.ownership.setdefault("__main__", OwnershipPlan()), self.env.module_scope)
+        for fn in self.parsed.functions:
+            scan(fn.body, self.ownership.setdefault(fn.name, OwnershipPlan()), self.env.func_scopes[fn.name])
+        for (cls_name, mname), scope in self.env.class_method_scopes.items():
+            from pyrust.inference import _find_method_node_in
+
+            found = _find_method_node_in({c.name: c for c in self.parsed.classes}, cls_name, mname)
+            if found:
+                scan(found[1].body, self.ownership.setdefault(f"{cls_name}.{mname}", OwnershipPlan()), scope)
+
+    @staticmethod
+    def _root_of(node: ast.expr) -> str | None:
+        while isinstance(node, (ast.Subscript, ast.Attribute)):
+            node = node.value
+        return node.id if isinstance(node, ast.Name) else None
+
+    def _fn_node_for(self, key: str) -> ast.FunctionDef | None:
+        if "." in key:
+            cls, m = key.split(".", 1)
+            for c in self.parsed.classes:
+                if c.name == cls:
+                    for item in c.body:
+                        if isinstance(item, ast.FunctionDef) and item.name == m:
+                            return item
+            return None
+        return next((f for f in self.parsed.functions if f.name == key), None)
+
+    def _call_alias_key(self, node: ast.Call, scope: ScopeInfo) -> str | None:
+        if isinstance(node.func, ast.Name):
+            if node.func.id in self.env.func_types:
+                return node.func.id
+            if node.func.id in self.env.class_types:
+                return self._alias_key(f"{node.func.id}.__init__")
+        if isinstance(node.func, ast.Attribute):
+            rt = scope.expr_types.get(id(node.func.value))
+            if isinstance(rt, ClassType):
+                return self._alias_key(f"{rt.name}.{node.func.attr}")
+        return None
+
+    def _place(self, node: ast.expr, scope: ScopeInfo, plan: OwnershipPlan, pre: list[str]) -> str:
+        """A Rust place expression (assignable / &mut-borrowable) for a
+        Python target chain such as `a[i].f[j]`. Index expressions are
+        evaluated into temporaries (in Python's left-to-right order) and
+        appended to `pre`."""
+        if isinstance(node, ast.Name):
+            if node.id == "self":
+                return self.self_var_name
+            if node.id in self._ref_names:
+                return f"(*{node.id})"
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return f"{self._place(node.value, scope, plan, pre)}.{node.attr}"
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
+            bt = scope.expr_types.get(id(node.value), UNKNOWN)
+            base = self._place(node.value, scope, plan, pre)
+            self._loop_counter += 1
+            tmp = f"__pk{self._loop_counter}"
+            if isinstance(bt, ListType):
+                pre.append(f"let {tmp} = {self._expr(node.slice, scope, plan, expected_type=INT)};")
+                return f"(*py_index_mut(&mut {base}, {tmp}))"
+            if isinstance(bt, DictType):
+                kt = scope.expr_types.get(id(node.slice), UNKNOWN)
+                if kt != bt.key:
+                    raise PyRustError(
+                        "dict subscript with a key of a different/dynamic type is not supported natively",
+                        lineno=getattr(node, "lineno", None),
+                        col=getattr(node, "col_offset", None),
+                        filename=self.parsed.filename,
+                    )
+                pre.append(f"let {tmp} = {self._expr(node.slice, scope, plan, expected_type=bt.key)};")
+                return f"(*{base}.index_mut(&{tmp}))"
+        raise PyRustError(
+            "this assignment target is not supported natively",
+            lineno=getattr(node, "lineno", None),
+            col=getattr(node, "col_offset", None),
+            filename=self.parsed.filename,
+        )
+
+    @staticmethod
+    def _has_subscript(node: ast.expr) -> bool:
+        while isinstance(node, (ast.Subscript, ast.Attribute)):
+            if isinstance(node, ast.Subscript):
+                return True
+            node = node.value
+        return False
+
+    def _locals_of(self, fn_node: ast.FunctionDef) -> set[str]:
+        from pyrust.definite import scope_locals
+
+        params = {a.arg for a in fn_node.args.posonlyargs + fn_node.args.args + fn_node.args.kwonlyargs}
+        if fn_node.args.vararg:
+            params.add(fn_node.args.vararg.arg)
+        return scope_locals(fn_node.body) | params
+
     def _emit_function(self, fn_node: ast.FunctionDef) -> None:
+        reachable = fn_node.name in self._called_names() or not self.is_entry
+        ft = self.env.func_types[fn_node.name]
+        params = ", ".join(f"_{a.arg}: {t.to_rust_type()}" for a, t in zip(_positional_params(fn_node), ft.params))
+        ret = f" -> {ft.ret.to_rust_type()}" if ft.ret != NONE else ""
+        name = "py_main" if fn_node.name == "main" else fn_node.name
+        sig = f"pub fn {name}({params}){ret}"
+        if fn_node.args.vararg is not None:
+            reachable = True
+        self._emit_or_stub(lambda: self._emit_function_checked(fn_node), sig, reachable)
+
+    def _emit_function_checked(self, fn_node: ast.FunctionDef) -> None:
         self._check_fn_decorators(fn_node, f"function {fn_node.name}")
         prev_in_function, self.in_function = self.in_function, True
+        prev_locals, self._fn_locals = self._fn_locals, self._locals_of(fn_node)
+        prev_key, self._fn_key = self._fn_key, fn_node.name
+        prev_refs, self._ref_names = self._ref_names, set(self.alias.ref_params.get(fn_node.name, set()))
         try:
             self._emit_function_body(fn_node)
         finally:
             self.in_function = prev_in_function
+            self._fn_locals = prev_locals
+            self._fn_key = prev_key
+            self._ref_names = prev_refs
 
     def _emit_function_body(self, fn_node: ast.FunctionDef) -> None:
         scope = self.env.func_scopes[fn_node.name]
@@ -452,6 +760,7 @@ class _RustGenerator:
         emit_name = "py_main" if fn_node.name == "main" else fn_node.name
         self.emit(f"pub fn {emit_name}({', '.join(param_strs)}){ret_str} {{")
         self.indent += 1
+        self.emit("let _py_frame = PyFrame::enter();")
         declared = set(self._all_param_names(fn_node)) | set(self.module_consts)
         self._emit_hoisted_declarations(scope, plan, declared)
         self._emit_block(fn_node.body, scope, plan, declared, current_class=None, expected_ret=ft.ret)
@@ -511,8 +820,26 @@ class _RustGenerator:
                 and stmt.targets[0].id in self.module_consts
             ):
                 return
+            if len(stmt.targets) == 1:
+                self._emit_assignment(stmt.targets[0], stmt.value, scope, plan, declared)
+                return
+            # a = b = value: evaluate once; a mutable value would be shared.
+            vt = scope.expr_types.get(id(stmt.value), UNKNOWN)
+            if not self._immutable(vt):
+                raise PyRustError(
+                    "chained assignment of a mutable value (a = b = []) makes both names share one object, "
+                    "which native code does not model yet",
+                    lineno=stmt.lineno,
+                    col=stmt.col_offset,
+                    filename=self.parsed.filename,
+                )
+            self._loop_counter += 1
+            tmp = f"__chain{self._loop_counter}"
+            self.emit(f"let {tmp} = {self._expr(stmt.value, scope, plan)};")
             for target in stmt.targets:
-                self._emit_assignment(target, stmt.value, scope, plan, declared)
+                ref = ast.Name(id=tmp if vt.is_copy else f"{tmp}.clone()", ctx=ast.Load())
+                scope.expr_types[id(ref)] = vt
+                self._emit_assignment(target, ref, scope, plan, declared)
             return
 
         if isinstance(stmt, ast.AnnAssign):
@@ -528,25 +855,40 @@ class _RustGenerator:
                 self._emit_assignment(stmt.target, synthetic, scope, plan, declared)
                 return
 
-            lhs = self._expr(stmt.target, scope, plan)
+            if isinstance(stmt.target, ast.Attribute) and (
+                self._has_subscript(stmt.target.value) or self._root_of(stmt.target) in self._ref_names
+            ):
+                target_t = scope.expr_types.get(id(stmt.target), UNKNOWN)
+                synthetic = ast.BinOp(left=stmt.target, op=stmt.op, right=stmt.value)
+                scope.expr_types[id(synthetic)] = target_t
+                self._emit_assignment(stmt.target, synthetic, scope, plan, declared)
+                return
+            lhs = self._recv_no_clone(stmt.target, scope, plan)
             target_t = scope.expr_types.get(id(stmt.target), UNKNOWN)
-            rhs = self._expr(stmt.value, scope, plan, target_t)
-            op_map = {
-                ast.Add: "+=",
-                ast.Sub: "-=",
-                ast.Mult: "*=",
-                ast.Div: "/=",
-            }
-            for op_cls, op_sym in op_map.items():
-                if isinstance(stmt.op, op_cls):
-                    if isinstance(stmt.target, ast.Name) and scope.var_types.get(stmt.target.id) == ANY:
-                        bin_op = op_sym[0]
-                        self.emit(f"{lhs} = {lhs}.clone() {bin_op} {rhs};")
-                    elif isinstance(stmt.op, ast.Add) and target_t == STR:
-                        self.emit(f"{lhs}.push_str(&{rhs});")
-                    else:
-                        self.emit(f"{lhs} {op_sym} {rhs};")
-                    return
+            value_t = scope.expr_types.get(id(stmt.value), UNKNOWN)
+            if isinstance(stmt.target, ast.Name):
+                target_t = scope.var_types.get(stmt.target.id, target_t)
+            if isinstance(stmt.op, ast.Add) and target_t == STR and value_t == STR:
+                self.emit(f"{lhs}.push_str(&{self._expr(stmt.value, scope, plan)});")
+                return
+            if isinstance(stmt.op, ast.Add) and isinstance(target_t, ListType):
+                # list += iterable extends in place (unlike list = list + other).
+                if not (isinstance(value_t, ListType) and value_t.elem == target_t.elem):
+                    raise PyRustError(
+                        "list += with a non-list or differently-typed value is not supported by PyRust yet",
+                        lineno=stmt.lineno,
+                        col=stmt.col_offset,
+                        filename=self.parsed.filename,
+                    )
+                self.emit(f"{{ let __ext = {self._expr(stmt.value, scope, plan)}.clone(); {lhs}.extend(__ext); }}")
+                return
+            simple = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*="}
+            sym = simple.get(type(stmt.op))
+            if sym and target_t in (INT, FLOAT) and value_t in (INT, FLOAT, BOOL) and not (
+                target_t == INT and value_t == FLOAT
+            ):
+                self.emit(f"{lhs} {sym} {self._expr(stmt.value, scope, plan, target_t)};")
+                return
             synthetic = ast.BinOp(left=stmt.target, op=stmt.op, right=stmt.value)
             scope.expr_types[id(synthetic)] = target_t
             self.emit(f"{lhs} = {self._expr(synthetic, scope, plan, target_t)};")
@@ -604,6 +946,10 @@ class _RustGenerator:
             self._end_loop_else(stmt.orelse, else_var, scope, plan, declared, current_class, expected_ret)
             return
 
+        if isinstance(stmt, ast.For) and id(stmt) in self.alias.byref_loops:
+            self._emit_byref_for(stmt, scope, plan, declared, current_class, expected_ret)
+            return
+
         if isinstance(stmt, ast.For):
             target_str = self._pattern_target(stmt.target, plan)
             iter_str = self._for_iter_expr(stmt.iter, scope, plan)
@@ -618,6 +964,16 @@ class _RustGenerator:
                     # iterator); everything else is `.iter().cloned()`.
                     iter_str = f"{iter_str}.map(PyValue::from)"
             else_var = self._begin_loop_else(stmt.orelse)
+            tgt_names = [n.id for n in ast.walk(stmt.target) if isinstance(n, ast.Name)]
+            rebind = None
+            if tgt_names and all(n in declared for n in tgt_names) and \
+                    all(isinstance(e, ast.Name) for e in ([stmt.target] if isinstance(stmt.target, ast.Name) else getattr(stmt.target, "elts", [None]))):
+                # Python's loop target is the enclosing variable: it keeps the
+                # last value after the loop.
+                self._loop_counter += 1
+                rebind = f"__it{self._loop_counter}"
+                pattern = stmt.target.id if isinstance(stmt.target, ast.Name) else "(" + ", ".join(tgt_names) + ")"
+                target_str = rebind
             if else_var is None:
                 self.emit(f"for {target_str} in {iter_str} {{")
             else:
@@ -626,6 +982,8 @@ class _RustGenerator:
                 self.emit(f"let mut {else_var} = true;")
                 self.emit(f"for {target_str} in {iter_str} {{")
             self.indent += 1
+            if rebind is not None:
+                self.emit(f"{pattern} = {rebind};")
             inner_declared = set(declared)
             if isinstance(stmt.target, ast.Name):
                 inner_declared.add(stmt.target.id)
@@ -638,10 +996,10 @@ class _RustGenerator:
         if isinstance(stmt, ast.Assert):
             cond_str = self._cond_expr(stmt.test, scope, plan)
             if stmt.msg:
-                msg_str = self._expr(stmt.msg, scope, plan)
-                self.emit(f'assert!({cond_str}, "{{}}", {msg_str});')
+                msg_str = self._print_arg(stmt.msg, scope, plan)
+                self.emit(f'if !({cond_str}) {{ py_raise(format!("AssertionError: {{}}", {msg_str})); }}')
             else:
-                self.emit(f"assert!({cond_str});")
+                self.emit(f'if !({cond_str}) {{ py_raise("AssertionError".to_string()); }}')
             return
 
         if isinstance(stmt, ast.Try):
@@ -715,6 +1073,50 @@ class _RustGenerator:
             col=getattr(stmt, "col_offset", None),
             filename=self.parsed.filename,
         )
+
+    def _emit_byref_for(self, stmt: ast.For, scope, plan, declared, current_class, expected_ret) -> None:
+        """`for x in xs:` whose body modifies x in place: iterate by reference."""
+        it, tgt = stmt.iter, stmt.target
+        pre: list[str] = []
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "enumerate":
+            place = self._place(it.args[0], scope, plan, pre)
+            iter_code = f"{place}.iter_mut().enumerate().map(|(__i, __v)| (__i as i64, __v))"
+            idx, var = tgt.elts[0], tgt.elts[1]
+            pattern = f"({self._pattern_target(idx)}, {var.id})"
+        elif isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr == "values":
+            place = self._place(it.func.value, scope, plan, pre)
+            iter_code = f"{place}.values_mut()"
+            var = tgt
+            pattern = var.id
+        elif isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr == "items":
+            place = self._place(it.func.value, scope, plan, pre)
+            iter_code = f"{place}.items_mut()"
+            k, var = tgt.elts[0], tgt.elts[1]
+            pattern = f"({self._pattern_target(k)}, {var.id})"
+        else:
+            place = self._place(it, scope, plan, pre)
+            iter_code = f"{place}.iter_mut()"
+            var = tgt
+            pattern = var.id
+        for line in pre:
+            self.emit(line)
+        else_var = self._begin_loop_else(stmt.orelse)
+        if else_var is not None:
+            self.emit("{")
+            self.indent += 1
+            self.emit(f"let mut {else_var} = true;")
+        self.emit(f"for {pattern} in {iter_code} {{")
+        self.indent += 1
+        inner_declared = set(declared) | {n.id for n in ast.walk(tgt) if isinstance(n, ast.Name)}
+        prev_refs = self._ref_names
+        self._ref_names = set(prev_refs) | {var.id}
+        try:
+            self._emit_block(stmt.body, scope, plan, inner_declared, current_class, expected_ret)
+        finally:
+            self._ref_names = prev_refs
+        self.indent -= 1
+        self.emit("}")
+        self._end_loop_else(stmt.orelse, else_var, scope, plan, declared, current_class, expected_ret)
 
     def _begin_loop_else(self, orelse: list[ast.stmt]) -> str | None:
         """Return flag var name if orelse non-empty (emits nothing)."""
@@ -805,17 +1207,28 @@ class _RustGenerator:
                 col=stmt.col_offset,
                 filename=self.parsed.filename,
             )
-        if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name):
+        if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name) and not exc.keywords:
             ename = exc.func.id
+            self._check_builtin_exception(ename, stmt)
             if not exc.args:
-                self.emit(f'panic!("{ename}");')
+                self.emit(f'py_raise("{ename}".to_string());')
+            elif len(exc.args) == 1:
+                # str(KeyError(k)) is repr(k); other exceptions use str(arg).
+                if ename == "KeyError":
+                    arg_code = f"py_repr(&{self._expr(exc.args[0], scope, plan)})"
+                else:
+                    arg_code = self._print_arg(exc.args[0], scope, plan)
+                self.emit(f'py_raise(format!("{ename}: {{}}", {arg_code}));')
             else:
-                parts = ", ".join(["{}"] * len(exc.args))
-                arg_code = ", ".join(self._expr(a, scope, plan) for a in exc.args)
-                self.emit(f'panic!("{ename}: {parts}", {arg_code});')
+                tup = ast.Tuple(elts=list(exc.args), ctx=ast.Load())
+                scope.expr_types[id(tup)] = TupleType(
+                    tuple(scope.expr_types.get(id(a), UNKNOWN) for a in exc.args)
+                )
+                self.emit(f'py_raise(format!("{ename}: {{}}", {self._print_arg(tup, scope, plan)}));')
             return
         if isinstance(exc, ast.Name):
-            self.emit(f'panic!("{exc.id}");')
+            self._check_builtin_exception(exc.id, stmt)
+            self.emit(f'py_raise("{exc.id}".to_string());')
             return
         raise PyRustError(
             "only `raise ErrorType(message)` is supported by PyRust",
@@ -824,18 +1237,51 @@ class _RustGenerator:
             filename=self.parsed.filename,
         )
 
+    _BUILTIN_EXCEPTIONS = {
+        "Exception", "ValueError", "TypeError", "KeyError", "IndexError", "RuntimeError",
+        "ZeroDivisionError", "ArithmeticError", "AssertionError", "AttributeError",
+        "NotImplementedError", "OverflowError", "LookupError", "NameError", "OSError",
+        "FileNotFoundError", "PermissionError", "StopIteration", "SystemError",
+        "UnicodeError", "EOFError", "RecursionError", "MemoryError", "TimeoutError",
+    }
+
+    def _check_builtin_exception(self, name: str, node: ast.AST) -> None:
+        # A user-defined exception class would print differently (and may
+        # carry custom __str__); only builtin exceptions are native.
+        if name not in self._BUILTIN_EXCEPTIONS or name in self.env.class_types:
+            raise PyRustError(
+                f"raising '{name}' is not supported natively (only builtin exception types are)",
+                lineno=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+                filename=self.parsed.filename,
+            )
+
+    @staticmethod
+    def _immutable(t: PyType) -> bool:
+        if t in (INT, FLOAT, BOOL, STR, NONE):
+            return True
+        if isinstance(t, TupleType):
+            return all(_RustGenerator._immutable(e) for e in t.elements)
+        return False
+
     def _emit_delete(self, stmt: ast.Delete, scope: ScopeInfo, plan: OwnershipPlan) -> None:
         for target in stmt.targets:
             if isinstance(target, ast.Subscript):
                 base_t = scope.expr_types.get(id(target.value), UNKNOWN)
-                base = self._expr(target.value, scope, plan)
+                if self._has_subscript(target.value) or self._root_of(target) in self._ref_names:
+                    pre: list[str] = []
+                    base = self._place(target.value, scope, plan, pre)
+                    for line in pre:
+                        self.emit(line)
+                else:
+                    base = self._recv_no_clone(target.value, scope, plan)
                 if isinstance(base_t, DictType):
                     key = self._expr(target.slice, scope, plan, expected_type=base_t.key)
-                    self.emit(f"let _ = {base}.remove(&{key});")
+                    self.emit(f"{base}.del_key(&{key});")
                     continue
                 if isinstance(base_t, ListType) and not isinstance(target.slice, ast.Slice):
-                    idx = self._expr(target.slice, scope, plan)
-                    self.emit(f"let _ = {base}.remove(({idx}) as usize);")
+                    idx = self._expr(target.slice, scope, plan, expected_type=INT)
+                    self.emit(f"py_list_del(&mut {base}, {idx});")
                     continue
                 if isinstance(base_t, ListType) and isinstance(target.slice, ast.Slice):
                     if target.slice.step is not None:
@@ -879,6 +1325,12 @@ class _RustGenerator:
             return
 
         if isinstance(target, (ast.Tuple, ast.List)):
+            vt = scope.expr_types.get(id(value), UNKNOWN)
+            simple = all(isinstance(e, ast.Name) for e in target.elts) and isinstance(vt, TupleType) \
+                and len(vt.elements) == len(target.elts)
+            if not simple:
+                self._emit_unpack(target, value, vt, scope, plan, declared)
+                return
             names = [elt.id for elt in target.elts if isinstance(elt, ast.Name)]
             val_code = self._expr(value, scope, plan)
             if all(n not in declared for n in names):
@@ -898,8 +1350,24 @@ class _RustGenerator:
             return
 
         if isinstance(target, ast.Attribute):
-            lhs = self._attribute_lvalue(target, scope, plan)
             attr_t = scope.expr_types.get(id(target), None)
+            if self._has_subscript(target.value) or self._root_of(target) in self._ref_names:
+                base_t = scope.expr_types.get(id(target.value))
+                if isinstance(base_t, ClassType):
+                    latest = self.env.class_types.get(base_t.name, base_t)
+                    attr_t = latest.fields.get(target.attr, attr_t)
+                if attr_t is None:
+                    attr_t = UNKNOWN
+                self._loop_counter += 1
+                vtmp = f"__pv{self._loop_counter}"
+                self.emit(f"let {vtmp} = {self._expr(value, scope, plan, expected_type=attr_t)};")
+                pre: list[str] = []
+                place = self._place(target, scope, plan, pre)
+                for line in pre:
+                    self.emit(line)
+                self.emit(f"{place} = {vtmp};")
+                return
+            lhs = self._attribute_lvalue(target, scope, plan)
             if (
                 attr_t is None
                 and isinstance(target.value, ast.Name)
@@ -914,6 +1382,52 @@ class _RustGenerator:
 
         if isinstance(target, ast.Subscript):
             base_t = scope.expr_types.get(id(target.value), UNKNOWN)
+            if base_t in (ANY, UNKNOWN):
+                raise PyRustError(
+                    "item assignment on a dynamically-typed value is not supported natively",
+                    lineno=getattr(target, "lineno", None),
+                    col=getattr(target, "col_offset", None),
+                    filename=self.parsed.filename,
+                )
+            if self._has_subscript(target.value) or self._root_of(target) in self._ref_names:
+                # Nested place: evaluate value, then indices, then write in place.
+                self._loop_counter += 1
+                vtmp = f"__pv{self._loop_counter}"
+                if isinstance(base_t, DictType):
+                    self.emit(f"let {vtmp} = {self._expr(value, scope, plan, expected_type=base_t.val)};")
+                elif isinstance(base_t, ListType) and not isinstance(target.slice, ast.Slice):
+                    self.emit(f"let {vtmp} = {self._expr(value, scope, plan, expected_type=base_t.elem)};")
+                elif isinstance(base_t, ListType):
+                    self.emit(f"let {vtmp} = {self._expr(value, scope, plan, expected_type=base_t)};")
+                else:
+                    raise PyRustError(
+                        "this item assignment is not supported natively",
+                        lineno=getattr(target, "lineno", None),
+                        col=getattr(target, "col_offset", None),
+                        filename=self.parsed.filename,
+                    )
+                pre: list[str] = []
+                base_place = self._place(target.value, scope, plan, pre)
+                for line in pre:
+                    self.emit(line)
+                if isinstance(base_t, DictType):
+                    k_code = self._expr(target.slice, scope, plan, expected_type=base_t.key)
+                    self.emit(f"{base_place}.insert({k_code}, {vtmp});")
+                elif isinstance(target.slice, ast.Slice):
+                    if target.slice.step is not None:
+                        raise PyRustError(
+                            "extended slice assignment (a[::2] = ...) is not supported by PyRust yet",
+                            lineno=getattr(target, "lineno", None),
+                            col=getattr(target, "col_offset", None),
+                            filename=self.parsed.filename,
+                        )
+                    low = f"Some({self._expr(target.slice.lower, scope, plan, expected_type=INT)})" if target.slice.lower else "None"
+                    high = f"Some({self._expr(target.slice.upper, scope, plan, expected_type=INT)})" if target.slice.upper else "None"
+                    self.emit(f"py_splice(&mut {base_place}, {low}, {high}, {vtmp});")
+                else:
+                    idx = self._expr(target.slice, scope, plan, expected_type=INT)
+                    self.emit(f"py_set_index(&mut {base_place}, {idx}, {vtmp});")
+                return
             base_code = self._recv_no_clone(target.value, scope, plan)
             if isinstance(base_t, DictType):
                 k_code = self._expr(target.slice, scope, plan, expected_type=base_t.key)
@@ -945,6 +1459,41 @@ class _RustGenerator:
                 v_code = self._expr(value, scope, plan, expected_type=elem_t)
                 self.emit(f"py_set_index(&mut {base_code}, {idx_code}, {v_code});")
             return
+
+    def _emit_unpack(
+        self,
+        target: ast.Tuple | ast.List,
+        value: ast.expr,
+        vt: PyType,
+        scope: ScopeInfo,
+        plan: OwnershipPlan,
+        declared: set[str],
+    ) -> None:
+        """`a, b[i] = value`: evaluate the right side once, then assign left to right."""
+        n = len(target.elts)
+
+        def err(msg: str) -> PyRustError:
+            return PyRustError(msg, lineno=getattr(target, "lineno", None),
+                               col=getattr(target, "col_offset", None), filename=self.parsed.filename)
+
+        if any(isinstance(e, ast.Starred) for e in target.elts):
+            raise err("starred unpacking (a, *b = ...) is not supported by PyRust yet")
+        self._loop_counter += 1
+        tmp = f"__unpack{self._loop_counter}"
+        self.emit(f"let {tmp} = {self._expr(value, scope, plan)};")
+        if isinstance(vt, TupleType):
+            if len(vt.elements) != n:
+                raise err(f"cannot unpack {len(vt.elements)} values into {n} targets")
+            items = [(f"{tmp}.{i}", et) for i, et in enumerate(vt.elements)]
+        elif isinstance(vt, ListType):
+            self.emit(f"py_unpack_check({tmp}.len(), {n});")
+            items = [(f"{tmp}[{i}]", vt.elem) for i in range(n)]
+        else:
+            raise err(f"unpacking a {vt.to_rust_type()} value is not supported by PyRust yet")
+        for elt, (code, et) in zip(target.elts, items):
+            ref = ast.Name(id=code if et.is_copy else f"{code}.clone()", ctx=ast.Load())
+            scope.expr_types[id(ref)] = et
+            self._emit_assignment(elt, ref, scope, plan, declared)
 
     def _attribute_lvalue(self, node: ast.Attribute, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         if isinstance(node.value, ast.Name) and node.value.id == "self":
@@ -1022,7 +1571,18 @@ class _RustGenerator:
                 chain += f".filter(|{target_pat}| {{ let {target_pat} = {target_pat}.clone(); {cond_code} }})"
         return chain
 
+    def _check_no_walrus(self, node: ast.AST) -> None:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.NamedExpr):
+                raise PyRustError(
+                    "the walrus operator inside a comprehension is not supported natively",
+                    lineno=getattr(sub, "lineno", None),
+                    col=getattr(sub, "col_offset", None),
+                    filename=self.parsed.filename,
+                )
+
     def _check_single_generator(self, node: ast.expr, kind: str) -> ast.comprehension:
+        self._check_no_walrus(node)
         gens = getattr(node, "generators", [])
         if len(gens) != 1:
             raise PyRustError(
@@ -1079,17 +1639,14 @@ class _RustGenerator:
                 col=getattr(part, "col_offset", None),
                 filename=self.parsed.filename,
             )
-        use_debug = part.conversion == 114 and val_t == STR  # !r on strings
         spec_node = part.format_spec
+        spec: str | None
         if spec_node is None or (isinstance(spec_node, ast.JoinedStr) and not spec_node.values):
-            rust_spec: str | None = ""
-            use_commas = False
+            spec = None
         elif isinstance(spec_node, ast.JoinedStr) and len(spec_node.values) == 1 and isinstance(
             spec_node.values[0], ast.Constant
-        ):
-            rust_spec, use_commas = self._translate_fmt_spec(
-                spec_node.values[0].value, val_t, spec_node
-            )
+        ) and isinstance(spec_node.values[0].value, str):
+            spec = spec_node.values[0].value
         else:
             raise PyRustError(
                 "nested f-string format specs (e.g. f'{x:{w}}') are not supported by PyRust yet",
@@ -1097,81 +1654,32 @@ class _RustGenerator:
                 col=getattr(spec_node, "col_offset", None),
                 filename=self.parsed.filename,
             )
-        arg_code = self._expr(part.value, scope, plan)
-        if use_debug and rust_spec:
-            raise PyRustError(
-                "!r with a format spec is not supported by PyRust yet",
-                lineno=getattr(part, "lineno", None),
-                col=getattr(part, "col_offset", None),
-                filename=self.parsed.filename,
-            )
-        if use_debug:
-            return "{:?}", arg_code
-        if use_commas:
-            return "{}", f"py_format_commas({arg_code})"
-        if not rust_spec:
+        if part.conversion in (114, 115):  # !r / !s: format the resulting str
+            self._check_printable(val_t, part.value)
+            fn = "py_repr" if part.conversion == 114 else "py_str"
+            base = f"{fn}(&{self._expr(part.value, scope, plan)})"
+            if spec is None:
+                return "{}", base
+            return "{}", f"py_format(&{base}, {self._rust_str_lit(spec)})"
+        if spec is None:
             return "{}", self._print_arg(part.value, scope, plan)
-        return "{:" + rust_spec + "}", arg_code
+        return "{}", self._format_with_spec(part.value, spec, scope, plan)
 
-    def _translate_fmt_spec(
-        self, spec: object, val_t: PyType, node: ast.AST
-    ) -> tuple[str, bool]:
-        """Translate a Python format spec to Rust. Returns (rust_spec, use_commas)."""
-        if not isinstance(spec, str):
+    @staticmethod
+    def _rust_str_lit(s: str) -> str:
+        return '"' + _RustGenerator._rust_string_escape(s) + '"'
+
+    def _format_with_spec(self, node: ast.expr, spec: str, scope: ScopeInfo, plan: OwnershipPlan) -> str:
+        """`format(value, spec)` with Python's format-spec mini-language."""
+        t = scope.expr_types.get(id(node), UNKNOWN)
+        if t not in (INT, FLOAT, BOOL, STR, ANY):
             raise PyRustError(
-                "f-string format specs must be plain strings in PyRust",
+                f"format spec '{spec}' on a {t.to_rust_type()} value is not supported by PyRust yet",
                 lineno=getattr(node, "lineno", None),
                 col=getattr(node, "col_offset", None),
                 filename=self.parsed.filename,
             )
-
-        def err() -> PyRustError:
-            return PyRustError(
-                f"format spec '{spec}' is not supported by PyRust yet",
-                lineno=getattr(node, "lineno", None),
-                col=getattr(node, "col_offset", None),
-                filename=self.parsed.filename,
-            )
-
-        m = re.match(
-            r"^(?P<align>[<>^]?)(?P<sign>[+\- ]?)(?P<alt>#?)(?P<zero>0?)(?P<width>\d*)(?P<comma>,?)(?P<prec>\.\d+)?(?P<kind>[bcdoxXneEfFgGs%])?$",
-            spec,
-        )
-        if not m:
-            raise err()
-        align, sign, alt, zero, width, comma, prec, kind = m.groups()
-        if alt or sign == " " or align == "=" or comma not in ("", ","):
-            raise err()
-        if sign == "-":
-            sign = ""
-        use_commas = comma == ","
-        if use_commas and (prec or (kind and kind not in ("d", ""))):
-            raise err()
-        if kind in (None, ""):
-            if prec:
-                # Bare precision on floats means significant digits in Python.
-                raise err()
-            rust_kind = ""
-        elif kind in ("d", "s", "n"):
-            rust_kind = ""
-        elif kind in ("x", "X", "o", "b"):
-            rust_kind = kind
-        elif kind in ("e", "E"):
-            rust_kind = (prec or ".6") + kind
-        elif kind in ("f", "F"):
-            # Rust has no F; {:.N} matches Python's f to 6 default places.
-            rust_kind = prec or ".6"
-        elif kind in ("g", "G", "%", "c"):
-            raise err()
-        else:
-            raise err()
-        rust_spec = f"{align}{sign}"
-        if zero and width and not align:
-            rust_spec += "0" + width
-        else:
-            rust_spec += width
-        rust_spec += rust_kind
-        return rust_spec, use_commas
+        return f"py_format(&{self._expr(node, scope, plan)}, {self._rust_str_lit(spec)})"
 
     def _str_format_call(self, node: ast.Call, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         """`"{} {x}".format(a, x=1)` -> `format!("{}", a, x=1)`-style Rust."""
@@ -1281,23 +1789,23 @@ class _RustGenerator:
                         )
                     arg_node = kw_map[name]
                 arg_t = scope.expr_types.get(id(arg_node), UNKNOWN)
-                if spec:
-                    rust_spec, use_commas = self._translate_fmt_spec(spec, arg_t, node)
-                    if use_commas:
-                        flush_literal()
-                        out_parts.append("{}")
-                        out_args.append(f"py_format_commas({self._expr(arg_node, scope, plan)})")
-                    else:
-                        flush_literal()
-                        out_parts.append("{:" + rust_spec + "}")
-                        out_args.append(self._expr(arg_node, scope, plan))
-                elif conv == "r" and arg_t == STR:
-                    flush_literal()
-                    out_parts.append("{:?}")
-                    out_args.append(self._expr(arg_node, scope, plan))
+                flush_literal()
+                out_parts.append("{}")
+                if conv in ("r", "s"):
+                    self._check_printable(arg_t, arg_node)
+                    fn = "py_repr" if conv == "r" else "py_str"
+                    base = f"{fn}(&{self._expr(arg_node, scope, plan)})"
+                    out_args.append(f"py_format(&{base}, {self._rust_str_lit(spec)})" if spec else base)
+                elif spec:
+                    if "{" in spec:
+                        raise PyRustError(
+                            "nested replacement fields in format specs are not supported by PyRust yet",
+                            lineno=node.lineno,
+                            col=node.col_offset,
+                            filename=self.parsed.filename,
+                        )
+                    out_args.append(self._format_with_spec(arg_node, spec, scope, plan))
                 else:
-                    flush_literal()
-                    out_parts.append("{}")
                     out_args.append(self._print_arg(arg_node, scope, plan))
                 i = j + 1
             elif ch == "}":
@@ -1335,6 +1843,15 @@ class _RustGenerator:
         if isinstance(args_node, ast.Tuple):
             arg_nodes = list(args_node.elts)
         else:
+            single_t = scope.expr_types.get(id(args_node), UNKNOWN)
+            if isinstance(single_t, (TupleType, DictType)) or single_t in (ANY, UNKNOWN):
+                # A tuple (or mapping) on the right supplies several arguments.
+                raise PyRustError(
+                    "% formatting with a non-literal tuple/mapping/dynamic operand is not supported by PyRust yet",
+                    lineno=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                    filename=self.parsed.filename,
+                )
             arg_nodes = [args_node]
         out_parts: list[str] = []
         out_args: list[str] = []
@@ -1385,45 +1902,15 @@ class _RustGenerator:
             arg_node = arg_nodes[k]
             k += 1
             arg_t = scope.expr_types.get(id(arg_node), UNKNOWN)
-            # Reuse the {}-style spec translator: the % body is already
-            # flags+width+precision; only the '-' flag needs remapping.
-            if conv not in ("s", "d", "i", "u", "r", "f", "e", "x", "X", "o"):
+            if conv not in ("s", "d", "i", "u", "r", "f", "F", "e", "E", "g", "G", "x", "X", "o"):
                 raise PyRustError(
                     f"%{conv} is not supported in % formatting",
                     lineno=getattr(node, "lineno", None),
                     col=getattr(node, "col_offset", None),
                     filename=self.parsed.filename,
                 )
-            body = fmt[i + 1 : j]
-            if body.startswith("-"):
-                body = "<" + body[1:]
-            kind = {"i": "d", "u": "d", "r": "s"}.get(conv, conv)
-            try:
-                rust_spec, use_commas = self._translate_fmt_spec(body + kind, arg_t, node)
-            except PyRustError:
-                raise PyRustError(
-                    f"format spec '%{body}{conv}' is not supported in % formatting",
-                    lineno=getattr(node, "lineno", None),
-                    col=getattr(node, "col_offset", None),
-                    filename=self.parsed.filename,
-                )
-            ph = "{}" if not rust_spec else "{:" + rust_spec + "}"
-            if conv == "r" and arg_t == STR:
-                out_parts.append(ph[:-1] + "?}" if rust_spec else "{:?}")
-                out_args.append(self._expr(arg_node, scope, plan))
-            elif conv in ("d", "i", "u"):
-                out_parts.append(ph)
-                out_args.append(self._expr(arg_node, scope, plan, expected_type=INT))
-            elif use_commas:
-                out_parts.append("{}")
-                out_args.append(f"py_format_commas({self._expr(arg_node, scope, plan)})")
-            elif conv in ("f", "e"):
-                # Precision belongs to the float itself, not a stringified copy.
-                out_parts.append(ph)
-                out_args.append(self._expr(arg_node, scope, plan))
-            else:
-                out_parts.append(ph)
-                out_args.append(self._print_arg(arg_node, scope, plan))
+            out_parts.append("{}")
+            out_args.append(self._percent_piece(fmt[i + 1 : j], conv, arg_node, arg_t, node, scope, plan))
             i = j + 1
         fmt_str = "".join(out_parts)
         if k != len(arg_nodes):
@@ -1435,28 +1922,174 @@ class _RustGenerator:
             )
         return f'format!("{fmt_str}", {", ".join(out_args)})'
 
+    def _percent_piece(
+        self,
+        body: str,
+        conv: str,
+        arg_node: ast.expr,
+        arg_t: PyType,
+        node: ast.AST,
+        scope: ScopeInfo,
+        plan: OwnershipPlan,
+    ) -> str:
+        """One `%`-conversion, expressed through Python's format-spec engine."""
+        m = re.match(r"^([-+ 0#]*)(\d*)(?:\.(\d+))?$", body)
+
+        def err() -> PyRustError:
+            return PyRustError(
+                f"format '%{body}{conv}' is not supported by PyRust yet",
+                lineno=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+                filename=self.parsed.filename,
+            )
+
+        if not m:
+            raise err()
+        flags, width, prec = m.group(1), m.group(2), m.group(3)
+        left = "-" in flags
+        if conv in ("s", "r"):
+            self._check_printable(arg_t, arg_node)
+            fn = "py_repr" if conv == "r" else "py_str"
+            spec = ("<" if left else ">") + width + (f".{prec}" if prec is not None else "")
+            base = f"{fn}(&{self._expr(arg_node, scope, plan)})"
+            return f"py_format(&{base}, {self._rust_str_lit(spec)})" if spec not in ("<", ">") else base
+        sign = "+" if "+" in flags else (" " if " " in flags else "")
+        align = "<" if left else ""
+        zero = "0" if ("0" in flags and not left) else ""
+        alt = "#" if "#" in flags else ""
+        if conv in ("d", "i", "u", "x", "X", "o"):
+            if prec is not None:
+                raise err()
+            if arg_t == INT:
+                val = self._expr(arg_node, scope, plan)
+            elif arg_t == BOOL:
+                val = f"({self._expr(arg_node, scope, plan)} as i64)"
+            elif arg_t == FLOAT and conv in ("d", "i", "u"):
+                val = f"py_int_of_float({self._expr(arg_node, scope, plan)})"
+            else:
+                raise err()
+            kind = "d" if conv in ("d", "i", "u") else conv
+            spec = f"{align}{sign}{alt}{zero}{width}{kind}"
+            return f"py_format(&{val}, {self._rust_str_lit(spec)})"
+        # float conversions
+        if arg_t in (INT, BOOL):
+            val = f"({self._expr(arg_node, scope, plan)} as f64)"
+        elif arg_t == FLOAT:
+            val = self._expr(arg_node, scope, plan)
+        else:
+            raise err()
+        p = f".{prec}" if prec is not None else ""
+        spec = f"{align}{sign}{alt}{zero}{width}{p}{conv}"
+        return f"py_format(&{val}, {self._rust_str_lit(spec)})"
+
     def _for_iter_expr(self, iter_node: ast.expr, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         if isinstance(iter_node, ast.Call) and isinstance(iter_node.func, ast.Name):
             fname = iter_node.func.id
             if fname == "range":
-                args = [self._expr(a, scope, plan) for a in iter_node.args]
-                if len(args) == 1:
-                    return f"(0..{args[0]})"
-                if len(args) == 2:
-                    return f"({args[0]}..{args[1]})"
-                if len(args) == 3:
-                    if _is_negative_expr(iter_node.args[2]):
-                        return f"py_range({args[0]}, {args[1]}, {args[2]}).into_iter()"
-                    return f"({args[0]}..{args[1]}).step_by({args[2]} as usize)"
+                return self._range_iter(iter_node, scope, plan)
             if fname == "enumerate" and len(iter_node.args) == 1:
-                inner = self._expr(iter_node.args[0], scope, plan)
-                return f"{inner}.iter().cloned().enumerate().map(|(i, v)| (i as i64, v))"
+                it = self._for_iter_expr(iter_node.args[0], scope, plan)
+                return f"{it}.enumerate().map(|(i, v)| (i as i64, v))"
         iter_t = scope.expr_types.get(id(iter_node), UNKNOWN)
+        self._check_ordered_iteration(iter_node, scope)
         if isinstance(iter_t, ClassType) and iter_t.name == "PyFile":
             iter_code = self._expr(iter_node, scope, plan)
             return f"({iter_code}).lines().into_iter()"
         iter_code = self._expr(iter_node, scope, plan)
-        return f"{iter_code}.iter().cloned()"
+        if iter_t == STR:
+            return f"{iter_code}.chars().map(|c| c.to_string()).collect::<Vec<String>>().into_iter()"
+        if isinstance(iter_t, DictType):
+            return f"{iter_code}.keys().into_iter()"
+        if iter_t == ANY:
+            return f"py_value_iter(&{iter_code}).into_iter()"
+        if isinstance(iter_t, (ListType, TupleType)) or iter_t == UNKNOWN:
+            return f"{iter_code}.iter().cloned()"
+        raise PyRustError(
+            f"iterating over a {iter_t.to_rust_type()} value is not supported by PyRust yet",
+            lineno=getattr(iter_node, "lineno", None),
+            col=getattr(iter_node, "col_offset", None),
+            filename=self.parsed.filename,
+        )
+
+    def _range_iter(self, node: ast.Call, scope: ScopeInfo, plan: OwnershipPlan) -> str:
+        """A Rust iterator over `range(...)` with Python semantics."""
+        for a in node.args:
+            if scope.expr_types.get(id(a), UNKNOWN) not in (INT, BOOL):
+                raise PyRustError(
+                    "range() arguments must be ints",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    filename=self.parsed.filename,
+                )
+        args = [self._expr(a, scope, plan, expected_type=INT) for a in node.args]
+        if node.keywords or not 1 <= len(args) <= 3:
+            raise PyRustError(
+                "range() takes 1 to 3 positional arguments",
+                lineno=node.lineno,
+                col=node.col_offset,
+                filename=self.parsed.filename,
+            )
+        if len(args) == 1:
+            return f"(0..{args[0]})"
+        if len(args) == 2:
+            return f"({args[0]}..{args[1]})"
+        step = node.args[2]
+        if isinstance(step, ast.Constant) and type(step.value) is int and step.value > 0:
+            return f"({args[0]}..{args[1]}).step_by({step.value})"
+        return f"py_range_iter({args[0]}, {args[1]}, {args[2]})"
+
+    def _check_ordered_iteration(self, node: ast.expr, scope: ScopeInfo) -> None:
+        """Iterating a set observes CPython's hash-table order, which native
+        code cannot reproduce; refuse it (sorted(), len(), `in` are fine)."""
+        t = scope.expr_types.get(id(node), UNKNOWN)
+        if isinstance(t, SetType):
+            raise PyRustError(
+                "iterating over a set is not supported natively (CPython's set order cannot be "
+                "reproduced); iterate over sorted(the_set) instead",
+                lineno=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+                filename=self.parsed.filename,
+            )
+
+    def _sum_call(self, node: ast.Call, scope: ScopeInfo, plan: OwnershipPlan) -> str:
+        at = scope.expr_types.get(id(node.args[0]), UNKNOWN)
+        inner = self._expr(node.args[0], scope, plan)
+        if isinstance(at, ListType):
+            elem, seq = at.elem, f"&{inner}"
+        elif isinstance(at, SetType) and at.elem in (INT, BOOL):
+            elem, seq = at.elem, f"&{inner}.iter().cloned().collect::<Vec<_>>()"
+        elif isinstance(at, DictType):
+            elem, seq = at.key, f"&{inner}.keys()"
+        else:
+            raise PyRustError(
+                f"sum() of a {at.to_rust_type()} value is not supported by PyRust yet",
+                lineno=node.lineno,
+                col=node.col_offset,
+                filename=self.parsed.filename,
+            )
+        start_t = scope.expr_types.get(id(node.args[1]), UNKNOWN) if len(node.args) == 2 else INT
+        start = self._expr(node.args[1], scope, plan) if len(node.args) == 2 else None
+        if elem == BOOL:
+            seq = f"&{seq[1:]}.iter().map(|b| *b as i64).collect::<Vec<i64>>()"
+            elem = INT
+        if elem in (INT, UNKNOWN) and start_t in (INT, BOOL):
+            total = f"py_sum_ints({seq})"
+            return total if start is None else f"({total} + {self._expr(node.args[1], scope, plan, expected_type=INT)})"
+        if elem == FLOAT and start is None:
+            return f"py_sum_floats({seq})"
+        if elem in (FLOAT, INT) and start_t == FLOAT:
+            if elem == INT:
+                seq = f"&{seq[1:]}.iter().map(|v| *v as f64).collect::<Vec<f64>>()"
+            return f"py_sum_floats_start({start}, {seq})"
+        if elem == ANY:
+            total = f"py_sum_values({seq})"
+            return total if start is None else f"({total} + {self._expr(node.args[1], scope, plan, expected_type=ANY)})"
+        raise PyRustError(
+            "this sum() combination is not supported by PyRust yet",
+            lineno=node.lineno,
+            col=node.col_offset,
+            filename=self.parsed.filename,
+        )
 
     def _cond_expr(self, node: ast.expr, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         t = scope.expr_types.get(id(node), UNKNOWN)
@@ -1478,11 +2111,20 @@ class _RustGenerator:
         plan: OwnershipPlan,
         expected_type: PyType | None = None,
     ) -> str:
+        if expected_type == UNKNOWN:
+            expected_type = ANY  # an unrefined slot is a PyValue in Rust
         if expected_type == ANY and isinstance(node, ast.Constant) and node.value is None:
             return "PyValue::None"
         actual_type = scope.expr_types.get(id(node), UNKNOWN)
         raw = self._expr_raw(node, scope, plan, actual_type)
-        if expected_type == ANY and actual_type != ANY:
+        if expected_type == ANY and actual_type not in (ANY, UNKNOWN):
+            if not self._pyvalue_convertible(actual_type):
+                raise PyRustError(
+                    f"a {actual_type.to_rust_type()} value cannot be stored in a dynamically-typed slot natively",
+                    lineno=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                    filename=self.parsed.filename,
+                )
             return f"PyValue::from({raw})"
         if expected_type == FLOAT and actual_type == INT:
             if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
@@ -1491,7 +2133,13 @@ class _RustGenerator:
         if expected_type == FLOAT and actual_type in (ANY, UNKNOWN):
             return f"((({raw})).as_f64())"
         if expected_type == INT and actual_type == FLOAT:
-            return f"({raw} as i64)"
+            # Python never truncates a float silently where an int is needed.
+            raise PyRustError(
+                "a float value is used where an int is required",
+                lineno=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+                filename=self.parsed.filename,
+            )
         if expected_type == INT and actual_type == BOOL:
             return f"({raw} as i64)"
         if expected_type == INT and actual_type in (ANY, UNKNOWN):
@@ -1499,6 +2147,16 @@ class _RustGenerator:
         if expected_type == BOOL and actual_type in (ANY, UNKNOWN):
             return f"((({raw})).is_truthy())"
         return raw
+
+    @staticmethod
+    def _pyvalue_convertible(t: PyType) -> bool:
+        if t in (INT, FLOAT, BOOL, STR, NONE, ANY, UNKNOWN):
+            return True
+        if isinstance(t, ListType):
+            return _RustGenerator._pyvalue_convertible(t.elem)
+        if isinstance(t, DictType):
+            return t.key == STR and _RustGenerator._pyvalue_convertible(t.val)
+        return False
 
     def _expr_raw(
         self,
@@ -1554,8 +2212,7 @@ class _RustGenerator:
                 return "std::env::args().collect::<Vec<String>>()"
             if (
                 self.in_function
-                and node.id not in scope.var_types
-                and node.id not in scope.params
+                and node.id not in self._fn_locals
                 and node.id not in self.module_consts
                 and node.id in self.env.module_scope.var_types
             ):
@@ -1566,6 +2223,9 @@ class _RustGenerator:
                     col=getattr(node, "col_offset", None),
                     filename=self.parsed.filename,
                 )
+            if node.id in self._ref_names:
+                # `&mut T` binding: borrow where a borrow is enough, else copy the value.
+                return node.id if id(node) in plan.borrow_expr_ids else f"{node.id}.clone()"
             if node.id in plan.clone_expr_ids or id(node) in plan.clone_expr_ids:
                 return f"{node.id}.clone()"
             return node.id
@@ -1581,8 +2241,12 @@ class _RustGenerator:
             if recv_any_t == ANY and not (
                 isinstance(node.value, ast.Name) and node.value.id in self.parsed.imports
             ):
-                recv_any = self._expr(node.value, scope, plan)
-                return f'py_value_get(&{recv_any}, &PyValue::from("{node.attr}".to_string()), PyValue::None)'
+                raise PyRustError(
+                    f"attribute '.{node.attr}' on a dynamically-typed value is not supported natively",
+                    lineno=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                    filename=self.parsed.filename,
+                )
             if isinstance(node.value, ast.Name) and node.value.id == "sys":
                 if node.attr == "argv":
                     return "std::env::args().collect::<Vec<String>>()"
@@ -1631,13 +2295,16 @@ class _RustGenerator:
             return f"{recv}.{node.attr}"
 
         if isinstance(node, ast.UnaryOp):
-            op_val = self._expr(node.operand, scope, plan)
-            if isinstance(node.op, ast.USub):
-                return f"-{op_val}"
-            if isinstance(node.op, ast.UAdd):
-                return f"{op_val}"
             if isinstance(node.op, ast.Not):
                 return f"!({self._cond_expr(node.operand, scope, plan)})"
+            ot = scope.expr_types.get(id(node.operand), UNKNOWN)
+            op_val = self._expr(node.operand, scope, plan, expected_type=INT if ot == BOOL else None)
+            if isinstance(node.op, ast.USub):
+                return f"(-{op_val})"
+            if isinstance(node.op, ast.UAdd):
+                return f"{op_val}"
+            if isinstance(node.op, ast.Invert) and ot in (INT, BOOL):
+                return f"(!{op_val})"
 
         if isinstance(node, ast.BinOp):
             return self._binop_expr(node, scope, plan, actual_type)
@@ -1660,6 +2327,13 @@ class _RustGenerator:
             for op, right_node in zip(node.ops, node.comparators):
                 if isinstance(op, (ast.In, ast.NotIn)):
                     container_t = scope.expr_types.get(id(right_node), UNKNOWN)
+                    if self._has_identity_object(container_t):
+                        raise PyRustError(
+                            "`in` over plain class instances (compared by identity in Python) is not supported natively",
+                            lineno=getattr(node, "lineno", None),
+                            col=getattr(node, "col_offset", None),
+                            filename=self.parsed.filename,
+                        )
                     c_code = self._expr(right_node, scope, plan)
                     l_code = self._expr(left_node, scope, plan)
                     if container_t == ANY:
@@ -1689,6 +2363,35 @@ class _RustGenerator:
                         )
                     lt = scope.expr_types.get(id(left_node), UNKNOWN)
                     rt = scope.expr_types.get(id(right_node), UNKNOWN)
+                    if self._has_identity_object(lt) or self._has_identity_object(rt):
+                        raise PyRustError(
+                            "comparing plain class instances (compared by identity in Python) is not supported natively",
+                            lineno=getattr(node, "lineno", None),
+                            col=getattr(node, "col_offset", None),
+                            filename=self.parsed.filename,
+                        )
+                    if self._is_dict_view(left_node) or self._is_dict_view(right_node):
+                        raise PyRustError(
+                            "comparing dict views is not supported natively",
+                            lineno=getattr(node, "lineno", None),
+                            col=getattr(node, "col_offset", None),
+                            filename=self.parsed.filename,
+                        )
+                    mixed = (lt in (INT, BOOL) and rt == FLOAT) or (lt == FLOAT and rt in (INT, BOOL))
+                    if mixed and isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+                        # Python compares int and float exactly (no rounding of the int).
+                        flip = {ast.Lt: "gt", ast.LtE: "ge", ast.Gt: "lt", ast.GtE: "le", ast.Eq: "eq", ast.NotEq: "eq"}
+                        same = {ast.Lt: "lt", ast.LtE: "le", ast.Gt: "gt", ast.GtE: "ge", ast.Eq: "eq", ast.NotEq: "eq"}
+                        if lt == FLOAT:
+                            i_node, f_node, name = right_node, left_node, flip[type(op)]
+                        else:
+                            i_node, f_node, name = left_node, right_node, same[type(op)]
+                        i_code = self._expr(i_node, scope, plan, expected_type=INT)
+                        f_code = self._expr(f_node, scope, plan)
+                        call = f"py_{name}_if({i_code}, {f_code})"
+                        parts.append(f"!{call}" if isinstance(op, ast.NotEq) else call)
+                        left_node = right_node
+                        continue
                     if _is_none_const(left_node) or _is_none_const(right_node):
                         target_t: PyType | None = ANY
                     elif lt == ANY or rt == ANY:
@@ -1780,6 +2483,7 @@ class _RustGenerator:
             return f"({', '.join(elts)})"
 
         if isinstance(node, ast.ListComp):
+            self._check_no_walrus(node)
             gen = self._check_single_generator(node, "list comprehensions")
             target_pat = self._pattern_target(gen.target)
             iter_code = self._for_iter_expr(gen.iter, scope, plan)
@@ -1808,12 +2512,24 @@ class _RustGenerator:
             idx_code = self._expr(node.slice, scope, plan)
             if val_t == ANY and not isinstance(node.slice, ast.Slice):
                 return f"py_dyn_index(&{val_code}, &PyValue::from({idx_code}))"
+            if self._is_dict_view(node.value):
+                raise PyRustError(
+                    "subscripting a dict view raises TypeError in Python",
+                    lineno=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                    filename=self.parsed.filename,
+                )
             if val_t == STR:
                 return f"py_str_index(&{val_code}, {idx_code})"
             if isinstance(val_t, DictType):
                 key_t = scope.expr_types.get(id(node.slice), UNKNOWN)
-                if key_t in (ANY, UNKNOWN):
-                    return f"py_value_get(&PyValue::from({val_code}), &PyValue::from({idx_code}), PyValue::None)"
+                if key_t != val_t.key:
+                    raise PyRustError(
+                        "dict subscript with a key of a different/dynamic type is not supported natively",
+                        lineno=getattr(node, "lineno", None),
+                        col=getattr(node, "col_offset", None),
+                        filename=self.parsed.filename,
+                    )
                 return f"{val_code}[&{idx_code}].clone()"
             if isinstance(val_t, TupleType):
                 const_idx: int | None = None
@@ -1918,14 +2634,30 @@ class _RustGenerator:
         if isinstance(node.op, ast.Add) and lt == STR and rt == STR:
             return f'format!("{{}}{{}}", {self._expr(node.left, scope, plan)}, {self._expr(node.right, scope, plan)})'
 
+        if isinstance(lt, SetType) and isinstance(rt, SetType):
+            set_ops = {ast.BitOr: "union", ast.BitAnd: "intersection", ast.Sub: "difference", ast.BitXor: "symmetric_difference"}
+            for op_cls, meth in set_ops.items():
+                if isinstance(node.op, op_cls):
+                    l_code = self._recv_no_clone(node.left, scope, plan)
+                    r_code = self._recv_no_clone(node.right, scope, plan)
+                    return f"{l_code}.{meth}(&{r_code}).cloned().collect::<HashSet<_>>()"
+
+        if self._is_dict_view(node.left) or self._is_dict_view(node.right):
+            raise PyRustError(
+                "arithmetic on dict views is not supported natively",
+                lineno=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+                filename=self.parsed.filename,
+            )
+
         if isinstance(node.op, ast.Add) and isinstance(lt, ListType) and isinstance(rt, ListType):
             return f"py_list_concat(&{self._expr(node.left, scope, plan)}, &{self._expr(node.right, scope, plan)})"
 
         if isinstance(node.op, ast.Mult):
-            if lt == STR and rt == INT:
-                return f"{self._expr(node.left, scope, plan)}.repeat({self._expr(node.right, scope, plan)} as usize)"
-            if lt == INT and rt == STR:
-                return f"{self._expr(node.right, scope, plan)}.repeat({self._expr(node.left, scope, plan)} as usize)"
+            if lt == STR and rt in (INT, BOOL):
+                return f"py_str_repeat(&{self._expr(node.left, scope, plan)}, {self._expr(node.right, scope, plan, expected_type=INT)})"
+            if lt in (INT, BOOL) and rt == STR:
+                return f"py_str_repeat(&{self._expr(node.right, scope, plan)}, {self._expr(node.left, scope, plan, expected_type=INT)})"
             if isinstance(lt, ListType) and rt == INT:
                 return f"py_list_repeat(&{self._expr(node.left, scope, plan)}, {self._expr(node.right, scope, plan)})"
             if lt == INT and isinstance(rt, ListType):
@@ -1979,18 +2711,28 @@ class _RustGenerator:
             if i < len(args)
             else "0.0"
         )
+        for a in args:
+            if scope.expr_types.get(id(a), UNKNOWN) not in (INT, FLOAT, BOOL, ANY):
+                raise PyRustError(
+                    f"math.{func_name}() of a non-number is not supported by PyRust yet",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    filename=self.parsed.filename,
+                )
         if func_name == "pow" and len(args) == 2:
-            return f"py_pow_f64({float_arg(0)}, {float_arg(1)})"
+            return f"py_math_pow({float_arg(0)}, {float_arg(1)})"
         if func_name == "atan2" and len(args) == 2:
-            return f"({float_arg(0)}).atan2({float_arg(1)})"
+            return f"f64::atan2({float_arg(0)}, {float_arg(1)})"
         if func_name == "hypot" and len(args) == 2:
-            return f"({float_arg(0)}).hypot({float_arg(1)})"
+            return f"py_math_hypot({float_arg(0)}, {float_arg(1)})"
         if func_name == "log" and len(args) == 2:
-            return f'py_div_f64(py_math1("log", {float_arg(0)}), py_math1("log", {float_arg(1)}))'
+            return f"py_math_log2args({float_arg(0)}, {float_arg(1)})"
         if func_name in MATH_FLOAT_FUNCS and func_name not in ("pow", "atan2", "hypot") and len(args) == 1:
             return f'py_math1("{func_name}", {float_arg(0)})'
         if func_name in ("floor", "ceil") and len(args) == 1:
-            return f"py_float_to_int(({float_arg(0)}).{func_name}())"
+            if scope.expr_types.get(id(args[0]), UNKNOWN) in (INT, BOOL):
+                return self._expr(args[0], scope, plan, expected_type=INT)
+            return f"py_float_to_int(f64::{func_name}({float_arg(0)}))"
         raise PyRustError(
             f"math.{func_name} is not supported by PyRust yet "
             "(supported functions: sqrt, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, "
@@ -2082,125 +2824,145 @@ class _RustGenerator:
     def _is_simple_scalar(t: PyType) -> bool:
         return t in (INT, FLOAT, BOOL, STR)
 
-    def _tuple_repr(self, prefix: str, tup: TupleType) -> tuple[str, list[str]]:
-        """Build (fmt, args) rendering a tuple with Python repr semantics."""
-        parts: list[str] = []
-        args: list[str] = []
-        for i, e in enumerate(tup.elements):
-            acc = f"{prefix}.{i}"
-            if e == FLOAT:
-                parts.append("{}")
-                args.append(f"py_float_str({acc})")
-            elif e == BOOL:
-                parts.append("{}")
-                args.append(f"(if {acc} {{ \"True\" }} else {{ \"False\" }})")
-            elif e == STR:
-                parts.append("{}")
-                args.append(f"py_repr_str(&{acc})")
-            elif e in (INT, ANY):
-                parts.append("{}")
-                args.append(acc)
-            else:
-                parts.append("{:?}")
-                args.append(acc)
-        if len(tup.elements) == 1:
-            return f"({', '.join(parts)},)", args
-        return f"({', '.join(parts)})", args
+    def _check_printable(self, t: PyType, node: ast.AST) -> None:
+        """Refuse values whose str()/repr() native code cannot reproduce."""
+        def bad(why: str) -> PyRustError:
+            return PyRustError(
+                f"printing {why} is not supported natively",
+                lineno=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+                filename=self.parsed.filename,
+            )
+
+        if isinstance(t, ClassType):
+            if t.name == "PyFile":
+                raise bad("a file object")
+            if t.name not in self._dataclass_names():
+                raise bad(f"a '{t.name}' object (its default repr shows a memory address)")
+            for ft in self.env.class_types.get(t.name, t).fields.values():
+                self._check_printable(ft, node)
+        elif isinstance(t, SetType):
+            raise bad("a set (CPython's set order cannot be reproduced)")
+        elif isinstance(t, ListType):
+            self._check_printable(t.elem, node)
+        elif isinstance(t, DictType):
+            self._check_printable(t.key, node)
+            self._check_printable(t.val, node)
+        elif isinstance(t, TupleType):
+            for e in t.elements:
+                self._check_printable(e, node)
+        if self._is_dict_view(node):
+            raise bad("a dict view")
+
+    def _has_identity_object(self, t: PyType) -> bool:
+        """True if values of type t contain plain (non-dataclass) objects."""
+        if isinstance(t, ClassType):
+            return t.name == "PyFile" or t.name not in self._dataclass_names()
+        if isinstance(t, (ListType, SetType)):
+            return self._has_identity_object(t.elem)
+        if isinstance(t, DictType):
+            return self._has_identity_object(t.key) or self._has_identity_object(t.val)
+        if isinstance(t, TupleType):
+            return any(self._has_identity_object(e) for e in t.elements)
+        return False
+
+    def _dataclass_names(self) -> set[str]:
+        from pyrust.inference import _is_dataclass
+
+        return {c.name for c in self.parsed.classes if _is_dataclass(c)}
+
+    @staticmethod
+    def _is_dict_view(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("keys", "values", "items")
+            and not node.args
+        )
 
     def _format_placeholder(self, arg: ast.expr, scope: ScopeInfo) -> str:
-        at = scope.expr_types.get(id(arg), UNKNOWN)
-        if isinstance(at, (ListType, DictType, SetType, TupleType, ClassType)):
-            return "{:?}"
         return "{}"
 
     def _print_placeholder(self, arg: ast.expr, scope: ScopeInfo) -> str:
-        at = scope.expr_types.get(id(arg), UNKNOWN)
-        if self._wrap_pyvalue(at):
-            return "{}"
-        if isinstance(at, TupleType) or (
-            isinstance(at, ListType)
-            and isinstance(at.elem, TupleType)
-            and all(self._is_simple_scalar(e) or e == ANY for e in at.elem.elements)
-        ):
-            return "{}"
-        return self._format_placeholder(arg, scope)
+        return "{}"
 
     def _print_call(self, node: ast.Call, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         sep_node: ast.expr | None = None
         end_node: ast.expr | None = None
+        file_node: ast.expr | None = None
+        flush = False
+
+        def err(msg: str) -> PyRustError:
+            return PyRustError(msg, lineno=node.lineno, col=node.col_offset, filename=self.parsed.filename)
+
         for kw in node.keywords:
             if kw.arg is None:
-                raise PyRustError(
-                    "** unpacking in print() is not supported by PyRust yet",
-                    lineno=node.lineno,
-                    col=node.col_offset,
-                    filename=self.parsed.filename,
-                )
+                raise err("** unpacking in print() is not supported by PyRust yet")
             if kw.arg == "sep":
                 sep_node = kw.value
             elif kw.arg == "end":
                 end_node = kw.value
+            elif kw.arg == "file":
+                file_node = kw.value
+            elif kw.arg == "flush":
+                if not isinstance(kw.value, ast.Constant):
+                    raise err("print(flush=...) needs a constant in PyRust")
+                flush = bool(kw.value.value)
             else:
-                raise PyRustError(
-                    f"print({kw.arg}=...) is not supported by PyRust yet (supported: sep, end)",
-                    lineno=node.lineno,
-                    col=node.col_offset,
-                    filename=self.parsed.filename,
-                )
-        if sep_node is None and end_node is None:
-            if not node.args:
-                return "println!()"
-            parts: list[str] = []
-            arg_exprs: list[str] = []
-            for a in node.args:
-                parts.append(self._print_placeholder(a, scope))
-                arg_exprs.append(self._print_arg(a, scope, plan))
-            fmt = " ".join(parts)
-            return f'println!("{fmt}", {", ".join(arg_exprs)})'
-        sep_code = (
-            self._expr(sep_node, scope, plan, expected_type=STR)
-            if sep_node is not None
-            else '" ".to_string()'
-        )
-        elems = ", ".join(
-            f"format!(\"{self._print_placeholder(a, scope)}\", {self._print_arg(a, scope, plan)})"
-            for a in node.args
-        )
-        content = f"vec![{elems}].join(&{sep_code})"
-        if end_node is None:
-            return f"println!(\"{{}}\", {content})"
-        if isinstance(end_node, ast.Constant) and end_node.value == "":
-            return f"print!(\"{{}}\", {content})"
-        if isinstance(end_node, ast.Constant) and isinstance(end_node.value, str):
-            return f"print!(\"{{}}{self._rust_string_escape(end_node.value)}\", {content})"
-        end_code = self._expr(end_node, scope, plan, expected_type=STR)
-        return f"print!(\"{{}}{{}}\", {content}, {end_code})"
+                raise err(f"print({kw.arg}=...) is not supported by PyRust yet")
+        to_stderr = False
+        if file_node is not None:
+            if isinstance(file_node, ast.Attribute) and isinstance(file_node.value, ast.Name) and \
+                    file_node.value.id == "sys" and file_node.attr in ("stderr", "stdout"):
+                to_stderr = file_node.attr == "stderr"
+            elif isinstance(file_node, ast.Name) and self.parsed.from_imports.get(file_node.id) == "sys" and \
+                    file_node.id in ("stderr", "stdout"):
+                to_stderr = file_node.id == "stderr"
+            else:
+                raise err("print(file=...) is only supported with sys.stdout / sys.stderr")
+        for a in node.args:
+            if isinstance(a, ast.Starred):
+                raise err("print(*args) is not supported by PyRust yet")
+        parts = [self._print_arg(a, scope, plan) for a in node.args]
+
+        def str_arg(n: ast.expr | None, default: str) -> str:
+            if n is None or (isinstance(n, ast.Constant) and n.value is None):
+                return default
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                return self._rust_str_lit(n.value)
+            if scope.expr_types.get(id(n), UNKNOWN) != STR:
+                raise err("print() sep/end must be strings")
+            return f"&{self._expr(n, scope, plan)}"
+
+        sep = str_arg(sep_node, '" "')
+        end = str_arg(end_node, '"\\n"')
+        if not to_stderr and sep == '" "' and end == '"\\n"':
+            code = f'py_println!("{" ".join(["{}"] * len(parts))}", {", ".join(parts)})' if parts else "py_println!()"
+        else:
+            pieces = ", ".join(f'format!("{{}}", {p})' for p in parts)
+            content = f"[{pieces}].join({sep})" if len(parts) != 1 else f'format!("{{}}", {parts[0]})'
+            if not parts:
+                content = "String::new()"
+            text = f'format!("{{}}{{}}", {content}, {end})'
+            code = f"py_eprint(&{text})" if to_stderr else f"py_write_str(&{text})"
+        if flush and not to_stderr:
+            return f"{{ {code}; let _ = py_flush_stdout(); }}"
+        return code
 
     def _print_arg(self, node: ast.expr, scope: ScopeInfo, plan: OwnershipPlan) -> str:
-        """Render a print()/str()-style argument (Python repr for float/bool/containers)."""
+        """Code implementing Display that renders `str(node)` like CPython."""
         actual = scope.expr_types.get(id(node), UNKNOWN)
+        self._check_printable(actual, node)
+        code = self._expr(node, scope, plan)
         if actual == FLOAT:
-            return f"py_float_str({self._expr(node, scope, plan)})"
+            return f"py_float_repr({code})"
         if actual == BOOL:
-            return f"(if {self._expr(node, scope, plan)} {{ \"True\" }} else {{ \"False\" }})"
-        if self._wrap_pyvalue(actual):
-            # _expr already inserts .clone() when ownership requires one.
-            return f"PyValue::from({self._expr(node, scope, plan)})"
-        if isinstance(actual, TupleType) and all(
-            self._is_simple_scalar(e) or e == ANY for e in actual.elements
-        ):
-            fmt, args = self._tuple_repr(self._expr(node, scope, plan), actual)
-            return f'format!("{fmt}", {", ".join(args)})'
-        if (
-            isinstance(actual, ListType)
-            and isinstance(actual.elem, TupleType)
-            and all(self._is_simple_scalar(e) or e == ANY for e in actual.elem.elements)
-        ):
-            raw = self._expr(node, scope, plan)
-            fmt, inner = self._tuple_repr("t", actual.elem)
-            map_arg = ", ".join(inner)
-            return f'format!("[{{}}]", {raw}.iter().map(|t| format!("{fmt}", {map_arg})).collect::<Vec<_>>().join(", "))'
-        return self._expr(node, scope, plan)
+            return f'(if {code} {{ "True" }} else {{ "False" }})'
+        if actual == NONE:
+            return f'{{ let _ = {code}; "None" }}'
+        if actual in (INT, STR, ANY, UNKNOWN):
+            return code
+        return f"py_str(&{code})"
 
     def _sys_call(
         self,
@@ -2218,13 +2980,17 @@ class _RustGenerator:
             )
         if attr == "exit":
             if not node.args:
-                return "std::process::exit(0)"
+                return "py_exit(0)"
             if len(node.args) == 1 and not node.keywords:
                 at = scope.expr_types.get(id(node.args[0]), UNKNOWN)
+                if isinstance(node.args[0], ast.Constant) and node.args[0].value is None:
+                    return "py_exit(0)"
                 code = self._expr(node.args[0], scope, plan)
                 if at == STR:
-                    return f'{{ eprintln!("{{}}", {code}); std::process::exit(1) }}'
-                return f"std::process::exit(({code}) as i32)"
+                    return f'{{ py_eprint(&format!("{{}}\\n", {code})); py_exit(1) }}'
+                if at in (INT, BOOL):
+                    # POSIX keeps the low 8 bits, like CPython's exit status.
+                    return f"py_exit((({code}) as i64 & 0xff) as i32)"
         raise PyRustError(
             f"sys.{attr} is not supported by PyRust yet (supported: argv, exit)",
             lineno=node.lineno,
@@ -2241,43 +3007,34 @@ class _RustGenerator:
     ) -> str:
         if attr == "getenv" and len(node.args) == 1:
             key = self._expr(node.args[0], scope, plan, expected_type=STR)
-            return f"std::env::var(&{key}).unwrap_or_default()"
+            return f"py_os_getenv(&{key})"
+        if attr == "getenv" and len(node.args) == 2 and scope.expr_types.get(id(node.args[1]), UNKNOWN) == STR:
+            key = self._expr(node.args[0], scope, plan, expected_type=STR)
+            dflt = self._expr(node.args[1], scope, plan, expected_type=STR)
+            return f"std::env::var(&{key}).unwrap_or({dflt})"
         if attr == "getcwd" and not node.args:
-            return "std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()"
+            return "py_os_getcwd()"
         if attr == "listdir" and len(node.args) <= 1:
             path = self._expr(node.args[0], scope, plan, expected_type=STR) if node.args else '".".to_string()'
-            return (
-                f"std::fs::read_dir(&{path}).map(|rd| rd.filter_map(|e| e.ok().and_then(|d| d.file_name().into_string().ok()))"
-                ".collect::<Vec<String>>()).unwrap_or_default()"
-            )
-        if attr in ("makedirs", "mkdir") and node.args:
+            return f"py_os_listdir(&{path})"
+        if attr in ("makedirs", "mkdir") and len(node.args) == 1:
             path = self._expr(node.args[0], scope, plan, expected_type=STR)
-            exist_ok = True
+            exist_ok = False  # Python's default for os.makedirs
             for kw in node.keywords:
-                if kw.arg == "exist_ok" and isinstance(kw.value, ast.Constant):
+                if attr == "makedirs" and kw.arg == "exist_ok" and isinstance(kw.value, ast.Constant):
                     exist_ok = bool(kw.value.value)
-                elif kw.arg is None:
-                    raise PyRustError(
-                        "** unpacking is not supported by PyRust yet",
-                        lineno=node.lineno,
-                        col=node.col_offset,
-                        filename=self.parsed.filename,
-                    )
                 else:
                     raise PyRustError(
-                        f"os.makedirs() got an unexpected keyword '{kw.arg}'",
+                        f"os.{attr}() with keyword '{kw.arg}' is not supported by PyRust yet",
                         lineno=node.lineno,
                         col=node.col_offset,
                         filename=self.parsed.filename,
                     )
-            if attr == "mkdir" and not exist_ok:
-                return f"std::fs::create_dir(&{path}).expect(\"FileExistsError\")"
-            if not exist_ok:
-                return f"{{ let _p = {path}; if !std::path::Path::new(&_p).exists() {{ std::fs::create_dir_all(&_p).expect(\"OSError\"); }} }}"
-            return f"let _ = std::fs::create_dir_all(&{path});"
+            recursive = "true" if attr == "makedirs" else "false"
+            return f"py_os_mkdir(&{path}, {recursive}, {str(exist_ok).lower()})"
         if attr == "remove" and len(node.args) == 1:
             path = self._expr(node.args[0], scope, plan, expected_type=STR)
-            return f"let _ = std::fs::remove_file(&{path});"
+            return f"py_os_remove(&{path})"
         raise PyRustError(
             f"os.{attr} is not supported by PyRust yet "
             "(supported: getenv, getcwd, listdir, makedirs, mkdir, remove)",
@@ -2299,7 +3056,7 @@ class _RustGenerator:
             return "py_perf_counter()"
         if attr == "sleep" and len(node.args) == 1:
             secs = self._expr(node.args[0], scope, plan, expected_type=FLOAT)
-            return f"std::thread::sleep(std::time::Duration::from_secs_f64({secs}))"
+            return f"py_sleep({secs})"
         raise PyRustError(
             f"time.{attr} is not supported by PyRust yet (supported: time, perf_counter, sleep)",
             lineno=node.lineno,
@@ -2374,7 +3131,27 @@ class _RustGenerator:
         scope: ScopeInfo,
         plan: OwnershipPlan,
     ) -> str:
-        if func_name in ("mean", "harmonic_mean", "variance", "pvariance", "stdev", "pstdev"):
+        if func_name in ("harmonic_mean", "stdev", "pstdev", "fmean", "geometric_mean"):
+            raise PyRustError(
+                f"statistics.{func_name} is not supported natively (CPython computes it with exact fractions)",
+                lineno=node.lineno,
+                col=node.col_offset,
+                filename=self.parsed.filename,
+            )
+        if func_name == "mean" and len(args) == 1:
+            at = scope.expr_types.get(id(args[0]), UNKNOWN)
+            if isinstance(at, ListType) and at.elem == FLOAT:
+                return f"PyValue::Float(py_mean_floats(&{self._expr(args[0], scope, plan)}))"
+        if func_name in ("mean", "variance", "pvariance"):
+            at = scope.expr_types.get(id(args[0]), UNKNOWN) if args else UNKNOWN
+            if not (isinstance(at, ListType) and at.elem in (INT, BOOL)):
+                raise PyRustError(
+                    f"statistics.{func_name} of non-integer data is not supported natively "
+                    "(CPython computes it with exact fractions)",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    filename=self.parsed.filename,
+                )
             return f"py_{func_name}(&{self._seq_pyvalues(args, scope, plan, node)})"
         if func_name in ("median", "median_low", "median_high"):
             return f"py_{func_name}(&{self._seq_pyvalues(args, scope, plan, node)})"
@@ -2476,9 +3253,44 @@ class _RustGenerator:
             kw_map[kw.arg] = kw.value
         n_fixed = len(ft.params) - (1 if ft.has_vararg else 0)
         out: list[str] = []
+        refs = self.alias.ref_params.get(self._alias_key(key), set())
+        if refs:
+            # A `&mut` argument must be the only access to its root in this call
+            # (Python would see one shared object; Rust cannot lend it twice).
+            ref_roots: list[str] = []
+            other_roots: set[str] = set()
+            for i, pname in enumerate(param_names[:n_fixed]):
+                a = pos_args[i] if i < len(pos_args) else kw_map.get(pname)
+                if a is None:
+                    continue
+                if pname in refs and self._root_of(a):
+                    ref_roots.append(self._root_of(a))
+                else:
+                    other_roots |= {n.id for n in ast.walk(a) if isinstance(n, ast.Name)}
+            dup = {r for r in ref_roots if ref_roots.count(r) > 1} | (set(ref_roots) & other_roots)
+            if dup:
+                raise PyRustError(
+                    f"passing '{sorted(dup)[0]}' (or parts of it) to a call that modifies one of them in place "
+                    "is not supported natively",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    filename=self.parsed.filename,
+                )
         for i in range(n_fixed):
             pname = param_names[i] if i < len(param_names) else None
             ptype = ft.params[i] if i < len(ft.params) else None
+            if pname in refs:
+                arg_node = pos_args[i] if i < len(pos_args) else kw_map.get(pname)
+                if arg_node is None:
+                    di = i - (n_fixed - len(defaults))
+                    out.append(f"&mut {self._expr(defaults[di], scope, plan, expected_type=ptype)}")
+                elif isinstance(arg_node, (ast.Name, ast.Attribute, ast.Subscript)) and self._root_of(arg_node):
+                    pre: list[str] = []
+                    place = self._place(arg_node, scope, plan, pre)
+                    out.append("{ " + " ".join(pre) + f" &mut {place} }}" if pre else f"&mut {place}")
+                else:
+                    out.append(f"&mut {self._expr(arg_node, scope, plan, expected_type=ptype)}")
+                continue
             if i < len(pos_args) and pname is not None and pname in kw_map:
                 raise PyRustError(
                     f"got multiple values for argument '{pname}'",
@@ -2532,6 +3344,85 @@ class _RustGenerator:
                     )
         return out
 
+    def _str_method_call(
+        self, node: ast.Call, attr: str, recv: str, scope: ScopeInfo, plan: OwnershipPlan
+    ) -> str:
+        args = node.args
+        n = len(args)
+
+        def err(msg: str | None = None) -> PyRustError:
+            return PyRustError(
+                msg or f"str.{attr}() with these arguments is not supported by PyRust yet",
+                lineno=node.lineno,
+                col=node.col_offset,
+                filename=self.parsed.filename,
+            )
+
+        def s_arg(i: int) -> str:
+            if scope.expr_types.get(id(args[i]), UNKNOWN) != STR:
+                raise err(f"str.{attr}() argument {i + 1} must be a str")
+            return self._expr(args[i], scope, plan, expected_type=STR)
+
+        def i_arg(i: int) -> str:
+            if scope.expr_types.get(id(args[i]), UNKNOWN) not in (INT, BOOL):
+                raise err(f"str.{attr}() argument {i + 1} must be an int")
+            return self._expr(args[i], scope, plan, expected_type=INT)
+
+        def opt_chars(i: int) -> str:
+            if n <= i or (isinstance(args[i], ast.Constant) and args[i].value is None):
+                return "None"
+            return f"Some(&{s_arg(i)})"
+
+        if attr == "upper" and n == 0:
+            return f"{recv}.to_uppercase()"
+        if attr == "lower" and n == 0:
+            return f"{recv}.to_lowercase()"
+        if attr in ("strip", "lstrip", "rstrip") and n <= 1:
+            return f"py_{attr}(&{recv}, {opt_chars(0)})"
+        if attr == "capitalize" and n == 0:
+            return f"py_capitalize(&{recv})"
+        if attr in ("isdigit", "isnumeric", "isdecimal", "isalpha", "isalnum", "isspace") and n == 0:
+            return f"py_str_{attr}(&{recv})"
+        if attr in ("find", "index") and 1 <= n <= 3:
+            start = f"Some({i_arg(1)})" if n >= 2 else "None"
+            end = f"Some({i_arg(2)})" if n >= 3 else "None"
+            if attr == "index":
+                if n > 1:
+                    raise err()
+                return f"py_str_index_of(&{recv}, &{s_arg(0)})"
+            return f"py_str_find(&{recv}, &{s_arg(0)}, {start}, {end})"
+        if attr == "rfind" and n == 1:
+            return f"py_str_rfind(&{recv}, &{s_arg(0)})"
+        if attr == "count" and n == 1:
+            return f"py_str_count(&{recv}, &{s_arg(0)})"
+        if attr in ("removeprefix", "removesuffix") and n == 1:
+            return f"py_{attr}(&{recv}, &{s_arg(0)})"
+        if attr == "split" and n <= 2 and not node.keywords:
+            maxsplit = i_arg(1) if n == 2 else "-1"
+            if n == 0 or (isinstance(args[0], ast.Constant) and args[0].value is None):
+                return f"py_split_ws_max(&{recv}, {maxsplit})"
+            return f"py_split(&{recv}, &{s_arg(0)}, {maxsplit})"
+        if attr == "splitlines" and n == 0:
+            return f"py_splitlines(&{recv})"
+        if attr == "replace" and 2 <= n <= 3:
+            count = i_arg(2) if n == 3 else "-1"
+            return f"py_str_replace(&{recv}, &{s_arg(0)}, &{s_arg(1)}, {count})"
+        if attr == "join" and n == 1:
+            jt = scope.expr_types.get(id(args[0]), UNKNOWN)
+            self._check_ordered_iteration(args[0], scope)
+            inner = self._expr(args[0], scope, plan)
+            if jt == STR:
+                return f"{inner}.chars().map(|c| c.to_string()).collect::<Vec<String>>().join(&{recv})"
+            if isinstance(jt, ListType) and jt.elem == STR:
+                return f"{inner}.join(&{recv})"
+            raise err("str.join() needs a list of str")
+        if attr in ("startswith", "endswith") and n == 1:
+            if scope.expr_types.get(id(args[0]), UNKNOWN) != STR:
+                raise err(f"str.{attr}() with a tuple is not supported by PyRust yet")
+            method = "starts_with" if attr == "startswith" else "ends_with"
+            return f"{recv}.{method}({s_arg(0)}.as_str())"
+        raise err(f"method '{attr}' is not supported on str by PyRust yet")
+
     def _call_expr(self, node: ast.Call, scope: ScopeInfo, plan: OwnershipPlan) -> str:
         if isinstance(node.func, ast.Name):
             fname = node.func.id
@@ -2540,7 +3431,14 @@ class _RustGenerator:
                 return self._print_call(node, scope, plan)
 
             if fname == "len" and len(node.args) == 1:
+                lt = scope.expr_types.get(id(node.args[0]), UNKNOWN)
+                if lt == STR:
+                    return f"py_str_len(&{self._expr(node.args[0], scope, plan)})"
                 return f"({self._expr(node.args[0], scope, plan)}.len() as i64)"
+
+            if fname == "repr" and len(node.args) == 1:
+                self._check_printable(scope.expr_types.get(id(node.args[0]), UNKNOWN), node.args[0])
+                return f"py_repr(&{self._expr(node.args[0], scope, plan)})"
 
             if fname == "str" and len(node.args) == 1:
                 return f'format!("{{}}", {self._print_arg(node.args[0], scope, plan)})'
@@ -2563,10 +3461,21 @@ class _RustGenerator:
                 at = scope.expr_types.get(id(node.args[0]), UNKNOWN)
                 inner = self._expr(node.args[0], scope, plan)
                 if at == STR:
-                    return f"{inner}.trim().parse::<i64>().unwrap_or(0)"
+                    return f"py_parse_int(&{inner})"
                 if at in (ANY, UNKNOWN):
-                    return f"({inner}.as_i64())"
-                return f"({inner} as i64)"
+                    return f"py_int_of_value(&{inner})"
+                if at == FLOAT:
+                    return f"py_int_of_float({inner})"
+                if at == INT:
+                    return inner
+                if at == BOOL:
+                    return f"({inner} as i64)"
+                raise PyRustError(
+                    f"int() of a {at.to_rust_type()} value is not supported by PyRust yet",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    filename=self.parsed.filename,
+                )
             if fname == "int" and not node.args:
                 return "0"
 
@@ -2574,10 +3483,19 @@ class _RustGenerator:
                 at = scope.expr_types.get(id(node.args[0]), UNKNOWN)
                 inner = self._expr(node.args[0], scope, plan)
                 if at == STR:
-                    return f"{inner}.trim().parse::<f64>().unwrap_or(0.0)"
+                    return f"py_parse_float(&{inner})"
                 if at in (ANY, UNKNOWN):
-                    return f"({inner}.as_f64())"
-                return f"({inner} as f64)"
+                    return f"py_float_of_value(&{inner})"
+                if at == FLOAT:
+                    return inner
+                if at in (INT, BOOL):
+                    return f"({inner} as f64)"
+                raise PyRustError(
+                    f"float() of a {at.to_rust_type()} value is not supported by PyRust yet",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    filename=self.parsed.filename,
+                )
             if fname == "float" and not node.args:
                 return "0.0"
 
@@ -2586,48 +3504,60 @@ class _RustGenerator:
                 inner = self._expr(node.args[0], scope, plan)
                 if at in (ANY, UNKNOWN):
                     return f"py_abs(&{inner})"
-                return f"{inner}.abs()"
+                if at == BOOL:
+                    return f"({inner} as i64)"
+                if at == INT:
+                    return f"i64::abs({inner})"
+                if at == FLOAT:
+                    return f"f64::abs({inner})"
+                raise PyRustError(
+                    f"abs() of a {at.to_rust_type()} value is not supported by PyRust yet",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    filename=self.parsed.filename,
+                )
 
-            if fname == "sum" and 1 <= len(node.args) <= 2:
-                at = scope.expr_types.get(id(node.args[0]), ListType(INT))
-                elem_t = at.elem if isinstance(at, ListType) else None
-                inner = self._expr(node.args[0], scope, plan)
-                dyn_sum = elem_t is None or elem_t == ANY or elem_t == UNKNOWN
-                if dyn_sum:
-                    total = f"{inner}.iter().cloned().fold(PyValue::Int(0), |a, b| a + b)"
-                else:
-                    elem_rust = elem_t.to_rust_type()  # type: ignore[union-attr]
-                    total = f"{inner}.iter().copied().sum::<{elem_rust}>()"
-                if len(node.args) == 2:
-                    if dyn_sum:
-                        total = f"({total} + PyValue::from({self._expr(node.args[1], scope, plan)}))"
-                    else:
-                        total = f"({total} + {self._expr(node.args[1], scope, plan, expected_type=elem_t)})"
-                return total
+            if fname == "sum" and 1 <= len(node.args) <= 2 and not node.keywords:
+                return self._sum_call(node, scope, plan)
 
             if fname == "sorted" and len(node.args) == 1:
-                if node.keywords:
+                reverse = False
+                for kw in node.keywords:
+                    if kw.arg == "reverse" and isinstance(kw.value, ast.Constant):
+                        reverse = bool(kw.value.value)
+                    else:
+                        raise PyRustError(
+                            "sorted() with key= (or a non-constant reverse=) is not supported by PyRust yet",
+                            lineno=node.lineno,
+                            col=node.col_offset,
+                            filename=self.parsed.filename,
+                        )
+                at_sorted = scope.expr_types.get(id(node.args[0]), UNKNOWN)
+                inner = self._expr(node.args[0], scope, plan)
+                if at_sorted == STR:
+                    items = f"{inner}.chars().map(|c| c.to_string()).collect::<Vec<String>>()"
+                elif isinstance(at_sorted, SetType):
+                    items = f"{inner}.iter().cloned().collect::<Vec<_>>()"
+                elif isinstance(at_sorted, DictType):
+                    items = f"{inner}.keys()"
+                elif isinstance(at_sorted, ListType):
+                    items = f"{inner}.to_vec()"
+                else:
                     raise PyRustError(
-                        "sorted() with keyword arguments is not supported by PyRust yet",
+                        f"sorted() of a {at_sorted.to_rust_type()} value is not supported by PyRust yet",
                         lineno=node.lineno,
                         col=node.col_offset,
                         filename=self.parsed.filename,
                     )
-                at_sorted = scope.expr_types.get(id(node.args[0]), UNKNOWN)
-                if at_sorted == STR:
-                    inner = self._expr(node.args[0], scope, plan)
-                    return f"py_sorted(&{inner}.chars().map(|c| c.to_string()).collect::<Vec<String>>())"
-                if isinstance(at_sorted, SetType):
-                    inner = self._expr(node.args[0], scope, plan)
-                    return f"py_sorted(&{inner}.iter().cloned().collect::<Vec<_>>())"
-                if isinstance(at_sorted, DictType):
-                    inner = self._expr(node.args[0], scope, plan)
-                    return f"py_sorted(&{inner}.keys())"
-                return f"py_sorted(&{self._expr(node.args[0], scope, plan)})"
+                if reverse:
+                    # CPython: reverse, stable sort, reverse (keeps ties in order).
+                    return f"{{ let mut __v = {items}; __v.reverse(); py_sort(&mut __v); __v.reverse(); __v }}"
+                return f"{{ let mut __v = {items}; py_sort(&mut __v); __v }}"
 
             if fname == "list":
                 if not node.args:
                     return "Vec::new()"
+                self._check_ordered_iteration(node.args[0], scope)
                 if scope.expr_types.get(id(node.args[0]), UNKNOWN) == STR:
                     inner = self._expr(node.args[0], scope, plan)
                     return f"{inner}.chars().map(|c| c.to_string()).collect::<Vec<String>>()"
@@ -2671,29 +3601,39 @@ class _RustGenerator:
                         )
 
             if fname == "enumerate" and 1 <= len(node.args) <= 2:
-                inner = self._expr(node.args[0], scope, plan)
+                it = self._for_iter_expr(node.args[0], scope, plan)
                 if len(node.args) == 2:
                     start = self._expr(node.args[1], scope, plan, expected_type=INT)
-                    return f"{inner}.iter().cloned().enumerate().map(|(i, v)| (i as i64 + {start}, v)).collect::<Vec<_>>()"
-                return f"{inner}.iter().cloned().enumerate().map(|(i, v)| (i as i64, v)).collect::<Vec<_>>()" 
+                    return f"{it}.enumerate().map(|(i, v)| (i as i64 + {start}, v)).collect::<Vec<_>>()"
+                return f"{it}.enumerate().map(|(i, v)| (i as i64, v)).collect::<Vec<_>>()"
 
             if fname == "divmod" and len(node.args) == 2:
-                a0 = self._expr(node.args[0], scope, plan)
-                a1 = self._expr(node.args[1], scope, plan)
                 at = scope.expr_types.get(id(node), TupleType((INT, INT)))
                 if isinstance(at, TupleType) and all(e == FLOAT for e in at.elements):
-                    return f"(py_floordiv_f64(({a0} as f64), ({a1} as f64)), py_mod_f64(({a0} as f64), ({a1} as f64)))"
-                return f"(py_floordiv({a0}, {a1}), py_mod({a0}, {a1}))"
+                    a0 = self._expr(node.args[0], scope, plan, expected_type=FLOAT)
+                    a1 = self._expr(node.args[1], scope, plan, expected_type=FLOAT)
+                    return f"py_divmod_f64({a0}, {a1})"
+                a0 = self._expr(node.args[0], scope, plan, expected_type=INT)
+                a1 = self._expr(node.args[1], scope, plan, expected_type=INT)
+                return f"py_divmod({a0}, {a1})"
 
             if fname == "round" and 1 <= len(node.args) <= 2:
-                if len(node.args) == 2:
-                    a0 = self._expr(node.args[0], scope, plan, expected_type=FLOAT)
-                    a1 = self._expr(node.args[1], scope, plan, expected_type=INT)
-                    return f"py_round_prec({a0}, {a1})"
                 at = scope.expr_types.get(id(node.args[0]), UNKNOWN)
-                if at == INT:
-                    return self._expr(node.args[0], scope, plan)
-                return f"py_round_bankers({self._expr(node.args[0], scope, plan, expected_type=FLOAT)})"
+                if at not in (INT, BOOL, FLOAT):
+                    raise PyRustError(
+                        f"round() of a {at.to_rust_type()} value is not supported by PyRust yet",
+                        lineno=node.lineno,
+                        col=node.col_offset,
+                        filename=self.parsed.filename,
+                    )
+                if len(node.args) == 2:
+                    a1 = self._expr(node.args[1], scope, plan, expected_type=INT)
+                    if at in (INT, BOOL):
+                        return f"py_round_int({self._expr(node.args[0], scope, plan, expected_type=INT)}, {a1})"
+                    return f"py_round_prec({self._expr(node.args[0], scope, plan)}, {a1})"
+                if at in (INT, BOOL):
+                    return self._expr(node.args[0], scope, plan, expected_type=INT)
+                return f"py_round_bankers({self._expr(node.args[0], scope, plan)})"
 
             if fname in ("all", "any") and len(node.args) == 1:
                 inner = self._expr(node.args[0], scope, plan)
@@ -2719,6 +3659,13 @@ class _RustGenerator:
 
             if fname == "reversed" and len(node.args) == 1:
                 at = scope.expr_types.get(id(node.args[0]), ListType(ANY))
+                if not (isinstance(at, ListType) or at == STR):
+                    raise PyRustError(
+                        f"reversed() of a {at.to_rust_type()} value is not supported by PyRust yet",
+                        lineno=node.lineno,
+                        col=node.col_offset,
+                        filename=self.parsed.filename,
+                    )
                 inner = self._expr(node.args[0], scope, plan)
                 if at == STR:
                     return f"{inner}.chars().rev().map(|c| c.to_string()).collect::<Vec<String>>()"
@@ -2726,21 +3673,21 @@ class _RustGenerator:
 
             if fname == "ord" and len(node.args) == 1:
                 inner = self._expr(node.args[0], scope, plan, expected_type=STR)
-                return f"({inner}.chars().next().expect(\"ord() of empty string\") as i64)"
+                return f"py_ord(&{inner})"
 
             if fname == "chr" and len(node.args) == 1:
                 inner = self._expr(node.args[0], scope, plan, expected_type=INT)
-                return f"std::char::from_u32(({inner}) as u32).unwrap_or('\\0').to_string()"
+                return f"py_chr({inner})"
 
             if fname in ("hex", "oct", "bin") and len(node.args) == 1:
                 inner = self._expr(node.args[0], scope, plan, expected_type=INT)
-                fmt = {"hex": "#x", "oct": "#o", "bin": "#b"}[fname]
-                return f'format!("{{:{fmt}}}", {inner})'
+                return f"py_{fname}({inner})"
 
-            if fname == "zip" and len(node.args) == 2:
-                a0 = self._expr(node.args[0], scope, plan)
-                a1 = self._expr(node.args[1], scope, plan)
-                return f"{a0}.iter().cloned().zip({a1}.iter().cloned()).collect::<Vec<_>>()"
+            if fname == "zip" and len(node.args) in (2, 3) and not node.keywords:
+                its = [self._for_iter_expr(a, scope, plan) for a in node.args]
+                if len(its) == 2:
+                    return f"{its[0]}.zip({its[1]}).collect::<Vec<_>>()"
+                return f"{its[0]}.zip({its[1]}).zip({its[2]}).map(|((a, b), c)| (a, b, c)).collect::<Vec<_>>()"
 
             if fname in ("min", "max") and node.args:
                 if node.keywords:
@@ -2751,32 +3698,31 @@ class _RustGenerator:
                         filename=self.parsed.filename,
                     )
                 if len(node.args) == 1:
-                    op = "min_by" if fname == "min" else "max_by"
                     inner = self._expr(node.args[0], scope, plan)
                     at = scope.expr_types.get(id(node.args[0]), ListType(INT))
                     if at == STR:
-                        cmp = "a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)"
-                        return f"{inner}.chars().{op}(|a, b| {cmp}).unwrap_or_default().to_string()"
-                    elem = at.elem if isinstance(at, ListType) else INT
-                    cmp = "a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)"
-                    if elem.is_copy:
-                        return f"*{inner}.iter().{op}(|a, b| {cmp}).unwrap()"
-                    return f"{inner}.iter().{op}(|a, b| {cmp}).cloned().unwrap()"
-                if len(node.args) == 2:
-                    a0 = self._expr(node.args[0], scope, plan)
-                    a1 = self._expr(node.args[1], scope, plan)
-                    return f"{a0}.{fname}({a1})"
+                        return f"py_{fname}_str(&{inner})"
+                    if isinstance(at, ListType):
+                        return f"py_{fname}_of(&{inner})"
+                    if isinstance(at, SetType):
+                        return f"py_{fname}_of(&{inner}.iter().cloned().collect::<Vec<_>>())"
+                    if isinstance(at, DictType):
+                        return f"py_{fname}_of(&{inner}.keys())"
+                    raise PyRustError(
+                        f"{fname}() of a {at.to_rust_type()} value is not supported by PyRust yet",
+                        lineno=node.lineno,
+                        col=node.col_offset,
+                        filename=self.parsed.filename,
+                    )
+                res_t = scope.expr_types.get(id(node), UNKNOWN)
+                codes = [self._expr(a, scope, plan, expected_type=res_t if res_t == ANY else None) for a in node.args]
+                acc = codes[0]
+                for c in codes[1:]:
+                    acc = f"py_{fname}2({acc}, {c})"
+                return acc
 
             if fname == "range":
-                args = [self._expr(a, scope, plan) for a in node.args]
-                if len(args) == 1:
-                    return f"(0..{args[0]}).collect::<Vec<i64>>()"
-                if len(args) == 2:
-                    return f"({args[0]}..{args[1]}).collect::<Vec<i64>>()"
-                if len(args) == 3:
-                    if _is_negative_expr(node.args[2]):
-                        return f"py_range({args[0]}, {args[1]}, {args[2]})"
-                    return f"({args[0]}..{args[1]}).step_by({args[2]} as usize).collect::<Vec<i64>>()"
+                return f"{self._range_iter(node, scope, plan)}.collect::<Vec<i64>>()"
 
             if fname == "input":
                 prompt = self._expr(node.args[0], scope, plan) if node.args else '""'
@@ -2922,7 +3868,26 @@ class _RustGenerator:
                 return self._pyfile_method_call(node, recv_t, scope, plan)
             if recv_t == STR and attr == "format":
                 return self._str_format_call(node, scope, plan)
+            mutating = attr in MUTATING_METHODS or (
+                isinstance(recv_t, ClassType)
+                and attr in self.alias_mut_methods().get(recv_t.name, set())
+            )
+            if mutating and (self._has_subscript(node.func.value) or self._root_of(node.func.value) in self._ref_names):
+                pre: list[str] = []
+                place = self._place(node.func.value, scope, plan, pre)
+                inner = ast.Call(func=ast.Attribute(value=ast.Name(id="__recv_place__", ctx=ast.Load()), attr=attr, ctx=ast.Load()),
+                                 args=node.args, keywords=node.keywords)
+                scope.expr_types[id(inner.func.value)] = recv_t
+                scope.expr_types[id(inner)] = scope.expr_types.get(id(node), UNKNOWN)
+                self._place_override = place
+                try:
+                    call_code = self._call_expr(inner, scope, plan)
+                finally:
+                    self._place_override = None
+                return "{ " + " ".join(pre) + f" {call_code} }}"
             recv_code = self._recv_no_clone(node.func.value, scope, plan)
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "__recv_place__":
+                recv_code = self._place_override
             args = [self._expr(a, scope, plan) for a in node.args]
 
             # Builtin-type methods must never silently drop keyword arguments
@@ -2952,41 +3917,70 @@ class _RustGenerator:
                 if attr == "insert" and len(args) == 2:
                     idx = self._expr(node.args[0], scope, plan, expected_type=INT)
                     elem_code = self._expr(node.args[1], scope, plan, expected_type=recv_t.elem)
-                    return f"{recv_code}.insert(({idx}) as usize, {elem_code})"
+                    return f"py_list_insert(&mut {recv_code}, {idx}, {elem_code})"
                 if attr == "clear" and not args:
                     return f"{recv_code}.clear()"
                 if attr == "pop" and not args:
-                    return f"{recv_code}.pop().unwrap_or_default()"
+                    return f"py_list_pop(&mut {recv_code})"
                 if attr == "pop" and len(args) == 1:
                     idx = self._expr(node.args[0], scope, plan, expected_type=INT)
-                    return f"{recv_code}.remove(({idx}) as usize)"
-                if attr == "extend" and args:
-                    return f"{recv_code}.extend({args[0]}.iter().cloned())"
+                    return f"py_list_pop_at(&mut {recv_code}, {idx})"
+                if attr == "extend" and len(args) == 1:
+                    et = scope.expr_types.get(id(node.args[0]), UNKNOWN)
+                    self._check_ordered_iteration(node.args[0], scope)
+                    if not (isinstance(et, ListType) and et.elem == recv_t.elem):
+                        raise PyRustError(
+                            "list.extend() with a non-list or differently-typed argument is not supported by PyRust yet",
+                            lineno=node.lineno,
+                            col=node.col_offset,
+                            filename=self.parsed.filename,
+                        )
+                    # Evaluate the argument first: `a.extend(a)` doubles a.
+                    return f"{{ let __ext = {args[0]}.clone(); {recv_code}.extend(__ext); }}"
                 if attr == "remove" and len(args) == 1:
                     elem_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.elem)
                     return f"py_list_remove(&mut {recv_code}, &{elem_code})"
+                if attr in ("index", "count", "remove") and self._has_identity_object(recv_t.elem):
+                    raise PyRustError(
+                        f"list.{attr}() over plain class instances (compared by identity in Python) is not supported natively",
+                        lineno=node.lineno,
+                        col=node.col_offset,
+                        filename=self.parsed.filename,
+                    )
                 if attr == "index" and len(args) == 1:
                     elem_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.elem)
-                    return f"{recv_code}.iter().position(|v| v == &{elem_code}).expect(\"ValueError: list.index(x): x not in list\") as i64"
+                    return f"py_list_index(&{recv_code}, &{elem_code})"
                 if attr == "count" and len(args) == 1:
                     elem_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.elem)
                     return f"py_list_count(&{recv_code}, &{elem_code})"
                 if attr == "copy" and not args:
                     return f"{recv_code}.clone()"
                 if attr == "sort" and not args and not node.keywords:
-                    return f"{recv_code}.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))"
+                    return f"py_sort(&mut {recv_code})"
                 if attr == "sort" and len(node.keywords) == 1 and len(args) == 0:
                     kw = node.keywords[0]
                     if kw.arg == "reverse" and isinstance(kw.value, ast.Constant):
                         if kw.value.value:
-                            return f"{{ {recv_code}.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)); {recv_code}.reverse(); }}"
-                        return f"{recv_code}.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))"
+                            # CPython: reverse, stable sort, reverse (ties keep their order).
+                            return f"{{ {recv_code}.reverse(); py_sort(&mut {recv_code}); {recv_code}.reverse(); }}"
+                        return f"py_sort(&mut {recv_code})"
                 if attr == "reverse" and not args:
                     return f"{recv_code}.reverse()"
 
-            if isinstance(recv_t, SetType) and attr == "add" and args:
-                elem_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.elem)
-                return f"{recv_code}.insert({elem_code})"
+            if isinstance(recv_t, SetType):
+                if attr == "add" and len(args) == 1:
+                    elem_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.elem)
+                    return f"{{ {recv_code}.insert({elem_code}); }}"
+                if attr == "discard" and len(args) == 1:
+                    elem_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.elem)
+                    return f"{{ {recv_code}.remove(&{elem_code}); }}"
+                if attr == "remove" and len(args) == 1:
+                    elem_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.elem)
+                    return f"{{ let __k = {elem_code}; if !{recv_code}.remove(&__k) {{ py_raise(format!(\"KeyError: {{}}\", py_repr(&__k))); }} }}"
+                if attr == "clear" and not args:
+                    return f"{recv_code}.clear()"
+                if attr == "copy" and not args:
+                    return f"{recv_code}.clone()"
 
             if isinstance(recv_t, DictType):
                 if attr == "get" and args:
@@ -3006,96 +4000,28 @@ class _RustGenerator:
                     if len(args) > 1:
                         dflt = self._expr(node.args[1], scope, plan, expected_type=recv_t.val)
                         return f"{recv_code}.remove(&{key_code}).unwrap_or({dflt})"
-                    return f"{recv_code}.remove(&{key_code}).expect(\"KeyError\")"
+                    return f"{recv_code}.pop_key(&{key_code})"
                 if attr == "setdefault" and len(args) == 2:
                     key_code = self._expr(node.args[0], scope, plan, expected_type=recv_t.key)
                     val_code = self._expr(node.args[1], scope, plan, expected_type=recv_t.val)
                     return f"{recv_code}.entry({key_code}).or_insert({val_code}).clone()"
                 if attr == "update" and len(args) == 1:
+                    if not isinstance(scope.expr_types.get(id(node.args[0]), UNKNOWN), DictType):
+                        raise PyRustError(
+                            "dict.update() with a non-dict argument is not supported by PyRust yet",
+                            lineno=node.lineno,
+                            col=node.col_offset,
+                            filename=self.parsed.filename,
+                        )
                     other = self._expr(node.args[0], scope, plan)
-                    return f"{recv_code}.extend({other}.iter().map(|(k, v)| (k.clone(), v.clone())))"
+                    return f"{{ let __upd = {other}.items(); {recv_code}.extend(__upd); }}"
                 if attr == "copy" and not args:
                     return f"{recv_code}.clone()"
                 if attr == "clear" and not args:
                     return f"{recv_code}.clear()"
 
             if recv_t == STR:
-                if attr == "upper":
-                    return f"{recv_code}.to_uppercase()"
-                if attr == "lower":
-                    return f"{recv_code}.to_lowercase()"
-                if attr == "strip":
-                    return f"{recv_code}.trim().to_string()"
-                if attr == "lstrip":
-                    return f"{recv_code}.trim_start().to_string()"
-                if attr == "rstrip":
-                    return f"{recv_code}.trim_end().to_string()"
-                if attr == "capitalize" and not args:
-                    return f"{{ let mut _c = {recv_code}.chars(); match _c.next() {{ None => String::new(), Some(_f) => _f.to_uppercase().collect::<String>() + _c.as_str() }} }}"
-                if attr in ("isdigit", "isnumeric"):
-                    return f"{recv_code}.chars().all(|c| c.is_ascii_digit())"
-                if attr == "isalpha":
-                    return f"{recv_code}.chars().all(|c| c.is_ascii_alphabetic())"
-                if attr == "isspace":
-                    return f"{recv_code}.chars().all(|c| c.is_whitespace())"
-                if attr == "find" and 1 <= len(args) <= 2:
-                    pat = self._expr(node.args[0], scope, plan, expected_type=STR)
-                    if len(args) == 2:
-                        start = self._expr(node.args[1], scope, plan, expected_type=INT)
-                        return (
-                            f"{{ let _st = ({start} as i64).max(0); {recv_code}.get(_st as usize..)"
-                            f".and_then(|_s| _s.find(&*{pat}).map(|_i| _i as i64 + _st)).unwrap_or(-1) }}"
-                        )
-                    return f"{recv_code}.find(&*{pat}).map(|i| i as i64).unwrap_or(-1)"
-                if attr == "count" and len(args) == 1:
-                    pat = self._expr(node.args[0], scope, plan, expected_type=STR)
-                    return f"{recv_code}.matches(&*{pat}).count() as i64"
-                if attr == "removeprefix" and len(args) == 1:
-                    pre = self._expr(node.args[0], scope, plan, expected_type=STR)
-                    return f"{{ let _s = {recv_code}; _s.strip_prefix(&*{pre}).unwrap_or(&_s).to_string() }}"
-                if attr == "removesuffix" and len(args) == 1:
-                    suf = self._expr(node.args[0], scope, plan, expected_type=STR)
-                    return f"{{ let _s = {recv_code}; _s.strip_suffix(&*{suf}).unwrap_or(&_s).to_string() }}"
-                if attr == "split" and not args:
-                    return f"py_split_whitespace(&{recv_code})"
-                if attr == "split" and len(args) <= 2:
-                    sep = self._expr(node.args[0], scope, plan, expected_type=STR)
-                    if len(args) == 2:
-                        n = node.args[1]
-                        if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool):
-                            return f"{recv_code}.splitn(({n.value} + 1) as usize, &*{sep}).map(|s| s.to_string()).collect::<Vec<String>>()"
-                        raise PyRustError(
-                            "str.split(sep, maxsplit) needs a constant maxsplit in PyRust",
-                            lineno=node.lineno,
-                            col=node.col_offset,
-                            filename=self.parsed.filename,
-                        )
-                    return f"{recv_code}.split(&*{sep}).map(|s| s.to_string()).collect::<Vec<String>>()"
-                if attr == "replace" and len(args) == 2:
-                    return f"{recv_code}.replace(&*{args[0]}, &*{args[1]})"
-                if attr == "join" and len(args) == 1:
-                    jt = scope.expr_types.get(id(node.args[0]), UNKNOWN)
-                    if jt == STR:
-                        return f"{args[0]}.chars().map(|c| c.to_string()).collect::<Vec<String>>().join(&*{recv_code})"
-                    return f"{args[0]}.join(&*{recv_code})"
-                if attr == "startswith" and len(args) == 1:
-                    if scope.expr_types.get(id(node.args[0]), UNKNOWN) != STR:
-                        raise PyRustError(
-                            "str.startswith() with a tuple is not supported by PyRust yet",
-                            lineno=node.lineno,
-                            col=node.col_offset,
-                            filename=self.parsed.filename,
-                        )
-                    return f"{recv_code}.starts_with(&*{args[0]})"
-                if attr == "endswith" and len(args) == 1:
-                    if scope.expr_types.get(id(node.args[0]), UNKNOWN) != STR:
-                        raise PyRustError(
-                            "str.endswith() with a tuple is not supported by PyRust yet",
-                            lineno=node.lineno,
-                            col=node.col_offset,
-                            filename=self.parsed.filename,
-                        )
-                    return f"{recv_code}.ends_with(&*{args[0]})"
+                return self._str_method_call(node, attr, recv_code, scope, plan)
 
             if isinstance(recv_t, ClassType):
                 cls_t = self.env.class_types.get(recv_t.name, recv_t)

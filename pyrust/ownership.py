@@ -13,6 +13,109 @@ class OwnershipPlan:
     mutable_vars: set[str] = field(default_factory=set)
     clone_expr_ids: set[int] = field(default_factory=set)
     borrow_params: dict[str, list[bool]] = field(default_factory=dict)
+    borrow_expr_ids: set[int] = field(default_factory=set)
+
+
+MUTATING_METHODS = {
+    "append", "extend", "insert", "pop", "remove", "clear", "sort", "reverse",
+    "add", "discard", "update", "setdefault", "popitem", "write", "close",
+}
+
+
+def _root_name(node: ast.expr) -> str | None:
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def mutating_methods(parsed: ParsedModule) -> dict[str, set[str]]:
+    """class name -> methods that (transitively) mutate `self`."""
+    result: dict[str, set[str]] = {}
+    for cls in parsed.classes:
+        methods = {m.name: m for m in cls.body if isinstance(m, ast.FunctionDef)}
+        direct: set[str] = set()
+        calls: dict[str, set[str]] = {}
+        for name, fn in methods.items():
+            calls[name] = set()
+            for node in ast.walk(fn):
+                targets: list[ast.expr] = []
+                if isinstance(node, (ast.Assign, ast.Delete)):
+                    targets = list(node.targets)
+                elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                    targets = [node.target]
+                for t in targets:
+                    if isinstance(t, (ast.Attribute, ast.Subscript)) and _root_name(t) == "self":
+                        direct.add(name)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    recv = node.func.value
+                    if node.func.attr in MUTATING_METHODS and isinstance(recv, (ast.Attribute, ast.Subscript)) \
+                            and _root_name(recv) == "self":
+                        direct.add(name)
+                    if isinstance(recv, ast.Name) and recv.id == "self":
+                        calls[name].add(node.func.attr)
+                    elif _root_name(recv) == "self":
+                        # self.field.method(...): mutating if that method mutates its receiver;
+                        # treated conservatively as a mutation of self.
+                        direct.add(name)
+        mut = set(direct)
+        changed = True
+        while changed:
+            changed = False
+            for name, callees in calls.items():
+                if name not in mut and callees & mut:
+                    mut.add(name)
+                    changed = True
+        result[cls.name] = mut
+    # single inheritance: inherited mutating methods
+    by_name = {c.name: c for c in parsed.classes}
+    for cls in parsed.classes:
+        seen = set()
+        base = cls
+        while base.bases and isinstance(base.bases[0], ast.Name) and base.bases[0].id in by_name \
+                and base.bases[0].id not in seen:
+            seen.add(base.bases[0].id)
+            base = by_name[base.bases[0].id]
+            own = {m.name for m in cls.body if isinstance(m, ast.FunctionDef)}
+            result[cls.name] |= {m for m in result.get(base.name, set()) if m not in own}
+    return result
+
+
+def _mutated_roots(stmts: list[ast.stmt], scope: ScopeInfo, mut_methods: dict[str, set[str]]) -> set[str]:
+    """Names whose value is modified in place (needs `let mut` / `&mut self`)."""
+    roots: set[str] = set()
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            targets: list[ast.expr] = []
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                targets = list(node.targets)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+                if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                    roots.add(node.target.id)
+            for t in targets:
+                for sub in ([t] if not isinstance(t, (ast.Tuple, ast.List)) else list(t.elts)):
+                    if isinstance(sub, (ast.Attribute, ast.Subscript)):
+                        r = _root_name(sub)
+                        if r:
+                            roots.add(r)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                recv = node.func.value
+                r = _root_name(recv)
+                if r is None:
+                    continue
+                if node.func.attr in MUTATING_METHODS:
+                    roots.add(r)
+                    continue
+                rt = scope.expr_types.get(id(recv))
+                cls_name = getattr(rt, "name", None)
+                if cls_name and node.func.attr in mut_methods.get(cls_name, set()):
+                    roots.add(r)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                    node.func.attr == "shuffle" and node.args:
+                r = _root_name(node.args[0])
+                if r:
+                    roots.add(r)
+    return roots
 
 
 def _analyze_scope_stmts(
@@ -24,6 +127,8 @@ def _analyze_scope_stmts(
     for var_name, count in scope.assignment_counts.items():
         if count > 1:
             mutable_vars.add(var_name)
+    if parsed is not None:
+        mutable_vars |= _mutated_roots(stmts, scope, mutating_methods(parsed))
 
     # Track loads of each non-Copy variable: (node, in_loop, is_borrow_only)
     loads_by_var: dict[str, list[tuple[ast.Name, bool, bool]]] = {}
@@ -165,6 +270,7 @@ def _analyze_scope_stmts(
     walk_stmts(stmts, in_loop=False)
 
     clone_expr_ids: set[int] = set()
+    borrow_expr_ids = {id(node) for occ in loads_by_var.values() for node, _, is_borrow in occ if is_borrow}
     for var_name, occurrences in loads_by_var.items():
         total = len(occurrences)
         for idx, (node, in_loop, is_borrow) in enumerate(occurrences):
@@ -174,7 +280,7 @@ def _analyze_scope_stmts(
             if idx < total - 1 or in_loop:
                 clone_expr_ids.add(id(node))
 
-    return OwnershipPlan(mutable_vars=mutable_vars, clone_expr_ids=clone_expr_ids)
+    return OwnershipPlan(mutable_vars=mutable_vars, clone_expr_ids=clone_expr_ids, borrow_expr_ids=borrow_expr_ids)
 
 
 def _random_borrow_call(expr: ast.Call, parsed: ParsedModule | None) -> str | None:

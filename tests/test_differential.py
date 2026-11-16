@@ -115,6 +115,11 @@ def test_matches_cpython(case: Path, tmp_path: Path) -> None:
 
     for label, got in (("cold", cold), ("warm", warm)):
         tier = _actual_tier(got.stderr.decode("utf-8", "replace"))
+        # Generated Rust that fails to compile is a PyRust bug even though the
+        # program still runs (on CPython): it must never pass silently.
+        assert "Cargo build failed" not in got.stderr.decode("utf-8", "replace"), (
+            f"native build failed\n{got.stderr.decode('utf-8', 'replace')[-3000:]}"
+        )
         context = (
             f"[{label} run, tier={tier}]\n--- pyrust stderr ---\n"
             f"{got.stderr.decode('utf-8', 'replace')[-3000:]}\n"

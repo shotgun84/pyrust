@@ -22,6 +22,7 @@ from pyrust.types import (
     type_from_annotation_name,
     unify_container_elem,
     unify_types,
+    arith_result_type,
 )
 
 MUTATING_METHODS = {
@@ -171,8 +172,51 @@ def parse_annotation(node: ast.expr | None, class_types: dict[str, ClassType] | 
     return UNKNOWN
 
 
+# Python identifiers that are reserved words in Rust (and cannot all be raw
+# identifiers): renamed consistently before analysis.
+RUST_RESERVED = {
+    "abstract", "become", "box", "const", "crate", "do", "dyn", "enum", "extern", "final", "fn",
+    "gen", "impl", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub",
+    "ref", "Self", "static", "struct", "super", "trait", "try", "type", "typeof", "unsafe", "unsized",
+    "use", "virtual", "where", "union", "main_",
+}
+
+
+def rename_rust_reserved(parsed: ParsedModule) -> None:
+    """Rename identifiers that Rust reserves (`type`, `match`, `move`, ...).
+
+    Records `parsed.rust_renames` (new -> original) so Python-visible text
+    (e.g. a dataclass repr) can still use the original spelling.
+    """
+    if getattr(parsed, "rust_renames", None) is not None:
+        return
+    renames: dict[str, str] = {}
+
+    def fix(name: str) -> str:
+        if name in RUST_RESERVED:
+            new = f"py_{name}"
+            renames[new] = name
+            return new
+        return name
+
+    for node in ast.walk(parsed.tree):
+        if isinstance(node, ast.Name):
+            node.id = fix(node.id)
+        elif isinstance(node, ast.arg):
+            node.arg = fix(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            node.name = fix(node.name)
+        elif isinstance(node, ast.Attribute):
+            node.attr = fix(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg:
+            node.arg = fix(node.arg)
+    parsed.from_imports = {fix(k): v for k, v in parsed.from_imports.items()}
+    parsed.rust_renames = renames  # type: ignore[attr-defined]
+
+
 class _TypeInferer:
     def __init__(self, parsed: ParsedModule) -> None:
+        rename_rust_reserved(parsed)
         self.parsed = parsed
         self.env = ModuleTypeEnv()
         self.func_nodes: dict[str, ast.FunctionDef] = {fn.name: fn for fn in parsed.functions}
@@ -764,6 +808,8 @@ class _TypeInferer:
                     if isinstance(target, ast.Subscript):
                         # Record base/index expression types for codegen.
                         self._infer_expr(target, scope, current_class)
+                    elif isinstance(target, ast.Attribute):
+                        self._infer_expr(target.value, scope, current_class)
                     self._assign_target(target, val_type, scope, current_class)
             elif isinstance(stmt, ast.AnnAssign):
                 ann_type = parse_annotation(stmt.annotation, self.env.class_types)
@@ -827,6 +873,12 @@ class _TypeInferer:
                 for target in stmt.targets:
                     if isinstance(target, ast.Subscript):
                         self._infer_expr(target, scope, current_class)
+            elif isinstance(stmt, ast.Raise):
+                if isinstance(stmt.exc, ast.Call):
+                    for a in stmt.exc.args:
+                        self._infer_expr(a, scope, current_class)
+                elif stmt.exc is not None and not isinstance(stmt.exc, ast.Name):
+                    self._infer_expr(stmt.exc, scope, current_class)
 
     def _assign_target(
         self,
@@ -923,6 +975,20 @@ class _TypeInferer:
                 scope.var_types[recv_name] = self.env.class_types[latest.name]
                 scope.mutated_vars.add(recv_name)
 
+    def _refine_receiver(self, recv: ast.expr, updated: PyType, scope: ScopeInfo) -> None:
+        """Record a container's refined type after an in-place method call
+        (`x.append(1)` on a variable or on an object field)."""
+        if isinstance(recv, ast.Name):
+            scope.var_types[recv.id] = updated
+        elif isinstance(recv, ast.Attribute) and isinstance(recv.value, ast.Name):
+            obj_t = scope.var_types.get(recv.value.id, self.env.module_scope.var_types.get(recv.value.id, UNKNOWN))
+            if isinstance(obj_t, ClassType):
+                latest = self.env.class_types.get(obj_t.name, obj_t)
+                fields = dict(latest.fields)
+                fields[recv.attr] = unify_container_elem(fields.get(recv.attr, UNKNOWN), updated)
+                self.env.class_types[latest.name] = ClassType(latest.name, fields, dict(latest.methods))
+                scope.var_types[recv.value.id] = self.env.class_types[latest.name]
+
     def _iterable_element_type(self, iter_type: PyType) -> PyType:
         if isinstance(iter_type, ListType):
             return iter_type.elem
@@ -940,11 +1006,16 @@ class _TypeInferer:
             return elem
         if iter_type == STR:
             return STR
+        if iter_type == UNKNOWN:
+            return UNKNOWN  # still being inferred (e.g. a recursive call's result)
         return ANY
 
     def _infer_binop_type(self, op: ast.operator, left: PyType, right: PyType) -> PyType:
         if left == ANY or right == ANY:
             return ANY
+        arith = arith_result_type(type(op).__name__, left, right)
+        if arith is not None:
+            return arith
         if isinstance(op, ast.Div):
             return FLOAT
         if isinstance(op, ast.FloorDiv):
@@ -965,8 +1036,10 @@ class _TypeInferer:
                 return right
         if isinstance(op, ast.Mod) and left == STR:
             return STR
-        if left in (BOOL, INT, FLOAT) and right in (BOOL, INT, FLOAT):
-            return unify_types(left, right)
+        if isinstance(left, SetType) and isinstance(right, SetType) and isinstance(
+            op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)
+        ):
+            return SetType(unify_container_elem(left.elem, right.elem))
         if left == UNKNOWN or right == UNKNOWN:
             return unify_types(left, right)
         return ANY
@@ -1012,6 +1085,8 @@ class _TypeInferer:
             operand_type = self._infer_expr(node.operand, scope, current_class)
             if isinstance(node.op, ast.Not):
                 return BOOL
+            if operand_type == BOOL:
+                return INT  # -True == -1, ~True == -2
             return operand_type
 
         if isinstance(node, ast.BinOp):
@@ -1141,6 +1216,8 @@ class _TypeInferer:
                         return val_t.elements[resolved]
             if val_t == STR and idx_t == INT:
                 return STR
+            if val_t == UNKNOWN:
+                return UNKNOWN
             return ANY
 
         if isinstance(node, ast.Attribute):
@@ -1205,12 +1282,32 @@ class _TypeInferer:
                 return INT
             if fname == "range":
                 return ListType(INT)
-            if fname in ("abs", "min", "max", "sum"):
+            if fname == "abs":
+                if not arg_types:
+                    return INT
+                return INT if arg_types[0] == BOOL else arg_types[0]
+            if fname == "sum":
+                if not arg_types:
+                    return INT
+                elem = self._iterable_element_type(arg_types[0])
+                if len(arg_types) >= 2:
+                    start = arg_types[1]
+                    if start == FLOAT and elem in (INT, FLOAT, BOOL):
+                        return FLOAT
+                    if start in (INT, BOOL) and elem in (INT, BOOL):
+                        return INT
+                    return ANY
+                if elem in (INT, BOOL, UNKNOWN):
+                    return INT
+                # sum([]) is the int 0 even for a list of floats.
+                return ANY
+            if fname in ("min", "max"):
                 if not arg_types:
                     return INT
                 first = arg_types[0]
-                if isinstance(first, ListType):
-                    return first.elem if first.elem != UNKNOWN else INT
+                if len(arg_types) == 1:
+                    elem = self._iterable_element_type(first)
+                    return elem if elem != UNKNOWN else INT
                 acc: PyType = UNKNOWN
                 for at in arg_types:
                     acc = unify_types(acc, at)
@@ -1257,7 +1354,7 @@ class _TypeInferer:
                 return TupleType((INT, INT))
             if fname == "round":
                 if len(arg_types) == 2:
-                    return FLOAT
+                    return INT if arg_types[0] in (INT, BOOL) else FLOAT
                 return INT
             if fname in ("all", "any"):
                 return BOOL
@@ -1305,7 +1402,9 @@ class _TypeInferer:
                 if fname == "exit":
                     return NONE
             elif alias_mod == "os":
-                if fname in ("getenv", "getcwd"):
+                if fname == "getenv":
+                    return STR if len(arg_types) == 2 and arg_types[1] == STR else ANY
+                if fname == "getcwd":
                     return STR
                 if fname == "listdir":
                     return ListType(STR)
@@ -1368,6 +1467,13 @@ class _TypeInferer:
                 self.env.func_types[fname] = FuncType(
                     params=new_params, ret=ft.ret, has_vararg=ft.has_vararg
                 )
+                # A container argument refined inside the callee (dst.append(1))
+                # is the caller's object: refine the caller's variable too.
+                for a, pt in zip(node.args, new_params):
+                    if isinstance(a, ast.Name) and isinstance(pt, (ListType, DictType, SetType)):
+                        cur = scope.var_types.get(a.id)
+                        if isinstance(cur, type(pt)):
+                            scope.var_types[a.id] = unify_container_elem(cur, pt)
                 return self.env.func_types[fname].ret
 
         if isinstance(node.func, ast.Attribute):
@@ -1378,14 +1484,12 @@ class _TypeInferer:
             if isinstance(recv_type, ListType):
                 if attr == "append" and arg_types:
                     updated = ListType(unify_container_elem(recv_type.elem, arg_types[0]))
-                    if isinstance(node.func.value, ast.Name):
-                        scope.var_types[node.func.value.id] = updated
+                    self._refine_receiver(node.func.value, updated, scope)
                     return NONE
                 if attr == "extend" and arg_types:
                     it = self._iterable_element_type(arg_types[0])
                     updated = ListType(unify_container_elem(recv_type.elem, it))
-                    if isinstance(node.func.value, ast.Name):
-                        scope.var_types[node.func.value.id] = updated
+                    self._refine_receiver(node.func.value, updated, scope)
                     return NONE
                 if attr == "pop":
                     return recv_type.elem
@@ -1400,8 +1504,7 @@ class _TypeInferer:
             if isinstance(recv_type, SetType):
                 if attr == "add" and arg_types:
                     updated = SetType(unify_container_elem(recv_type.elem, arg_types[0]))
-                    if isinstance(node.func.value, ast.Name):
-                        scope.var_types[node.func.value.id] = updated
+                    self._refine_receiver(node.func.value, updated, scope)
                     return NONE
                 if attr == "contains":
                     return BOOL
@@ -1424,8 +1527,7 @@ class _TypeInferer:
                         unify_container_elem(recv_type.key, arg_types[0]),
                         unify_container_elem(recv_type.val, arg_types[1]),
                     )
-                    if isinstance(node.func.value, ast.Name):
-                        scope.var_types[node.func.value.id] = updated
+                    self._refine_receiver(node.func.value, updated, scope)
                     return updated.val
                 if attr == "update" and arg_types:
                     other = arg_types[0]
@@ -1434,19 +1536,18 @@ class _TypeInferer:
                             unify_container_elem(recv_type.key, other.key),
                             unify_container_elem(recv_type.val, other.val),
                         )
-                        if isinstance(node.func.value, ast.Name):
-                            scope.var_types[node.func.value.id] = updated
+                        self._refine_receiver(node.func.value, updated, scope)
                     return NONE
 
             # String methods
             if recv_type == STR:
                 if attr in ("upper", "lower", "strip", "lstrip", "rstrip", "replace", "join", "format", "capitalize", "removeprefix", "removesuffix"):
                     return STR
-                if attr == "split":
+                if attr in ("split", "splitlines"):
                     return ListType(STR)
-                if attr in ("startswith", "endswith", "isdigit", "isalpha", "isspace", "isnumeric"):
+                if attr in ("startswith", "endswith", "isdigit", "isalpha", "isspace", "isnumeric", "isdecimal", "isalnum"):
                     return BOOL
-                if attr in ("find", "count", "index"):
+                if attr in ("find", "rfind", "count", "index"):
                     return INT
 
             # User class method call
@@ -1498,7 +1599,9 @@ class _TypeInferer:
                     if attr == "exit":
                         return NONE
                 if mod_name == "os":
-                    if attr in ("getenv", "getcwd"):
+                    if attr == "getenv":
+                        return STR if len(arg_types) == 2 and arg_types[1] == STR else ANY
+                    if attr == "getcwd":
                         return STR
                     if attr == "listdir":
                         return ListType(STR)
@@ -1566,7 +1669,9 @@ class _TypeInferer:
 
     @staticmethod
     def _infer_statistics_call(func_name: str, arg_types: list[PyType]) -> PyType:
-        if func_name in ("mean", "harmonic_mean", "variance", "pvariance", "stdev", "pstdev"):
+        if func_name in ("mean", "variance", "pvariance"):
+            return ANY  # int when the exact result is integral, else float
+        if func_name in ("harmonic_mean", "stdev", "pstdev"):
             return FLOAT
         if func_name == "mode" and arg_types and isinstance(arg_types[0], ListType):
             elem = arg_types[0].elem

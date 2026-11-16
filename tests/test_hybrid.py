@@ -201,7 +201,9 @@ def test_hybrid_output_is_identical_to_cpython(tmp_path: Path, capfd):
 
 
 @needs_cargo
-def test_native_tier_aborts_on_int_overflow_instead_of_wrapping(tmp_path: Path, capfd):
+def test_native_int_overflow_finishes_on_cpython_with_exact_result(tmp_path: Path, capfd):
+    # Native ints are 64-bit. On overflow the native program re-runs on CPython
+    # (it has no side effects yet), hiding the output it already printed.
     script = tmp_path / "ovf.pyr"
     script.write_text(
         "def grow(n):\n    x = 1\n    for i in range(n):\n        x = x * 3\n    return x\n"
@@ -210,8 +212,32 @@ def test_native_tier_aborts_on_int_overflow_instead_of_wrapping(tmp_path: Path, 
     )
     rc = run_project(script, native_only=True)
     out, _ = capfd.readouterr()
-    assert out.split() == ["59049"]  # correct first result, then a loud abort
+    assert out.split() == ["59049", str(3**80)]
+    assert rc == 0
+
+
+@needs_cargo
+def test_native_int_overflow_after_side_effects_stops_loudly(tmp_path: Path, capfd):
+    # After writing a file a replay could repeat the side effect: stop with a
+    # clear OverflowError instead (never a wrong number).
+    script = tmp_path / "ovf2.pyr"
+    script.write_text(
+        "with open('out.txt', 'w') as f:\n    f.write('x')\n"
+        "x = 1\nfor i in range(80):\n    x = x * 3\nprint(x)\n",
+        encoding="utf-8",
+    )
+    import os
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        rc = run_project(script, native_only=True)
+    finally:
+        os.chdir(cwd)
+    out, err = capfd.readouterr()
     assert rc != 0
+    assert out == ""
+    assert "OverflowError" in err and "64-bit" in err
 
 
 def test_constant_bigint_is_refused_natively():

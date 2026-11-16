@@ -27,7 +27,7 @@ print(total)
 """
     rust = transpile_source(src)
     assert "let mut total: i64 = 0;" in rust
-    assert "for i in (0..10).step_by(2 as usize)" in rust
+    assert "for i in (0..10).step_by(2)" in rust
     assert "total += i;" in rust
     assert "println!" in rust
 
@@ -41,9 +41,9 @@ r = -7 % 3
 p = 2 ** 8
 """
     rust = transpile_source(src)
-    assert "py_index(&nums, -1)" in rust
+    assert "py_index(&nums, (-1))" in rust
     assert "py_floordiv(7, 2)" in rust
-    assert "py_mod(-7, 3)" in rust
+    assert "py_mod((-7), 3)" in rust
     assert "py_pow(2, 8)" in rust
 
 
@@ -149,7 +149,7 @@ d = {"k": 10}
 d["k"] += 1
 """
     rust = transpile_source(src)
-    assert "py_set_index(&mut items, -1, 99);" in rust
+    assert "py_set_index(&mut items, (-1), 99);" in rust
     assert "py_set_index(&mut items, 0, (py_index(&items, 0) + 5));" in rust
     assert 'd.insert("k".to_string(), (d[&"k".to_string()].clone() + 1));' in rust
 
@@ -163,7 +163,7 @@ tup = (10, 20, 30)
 last_t = tup[-1]
 """
     rust = transpile_source(src)
-    assert "py_str_index(&s, -1)" in rust
+    assert "py_str_index(&s, (-1))" in rust
     assert "py_str_slice(&s, Some(1), Some(4), 1)" in rust
     assert "tup.2" in rust
 
@@ -257,7 +257,7 @@ f = math.floor(3.7)
 """
     rust = transpile_source(src)
     assert 'py_math1("sqrt", 16.0f64)' in rust
-    assert "py_float_to_int((3.7f64).floor())" in rust
+    assert "py_float_to_int(f64::floor(3.7f64))" in rust
 
 
 def test_dep_math_constants_map_to_rust_consts():
@@ -310,11 +310,11 @@ def test_honesty_unsupported_constructs_raise():
         "print(list(map(str, [1])))\n",
         "x = [1]\nx.title()\n",
         "a = [1]\nb = a @ a\n",
-        "def f():\n    yield 1\n",
+        "def f():\n    yield 1\nf()\n",
         "f = lambda x: x\n",
         "x = 1\nmatch x:\n    case 1:\n        print(1)\n",
-        "def outer():\n    def inner():\n        return 1\n    return inner()\n",
-        "def f():\n    global x\n    x = 1\n",
+        "def outer():\n    def inner():\n        return 1\n    return inner()\nouter()\n",
+        "def f():\n    global x\n    x = 1\nf()\n",
         "import math\nprint(math.gamma(10))\n",
         "xs = [3, 1]\nxs.sort(key=len)\n",
         "class A:\n    def __repr__(self):\n        return 'A'\nprint(A())\n",
@@ -371,14 +371,17 @@ def test_dict_and_set_comprehensions():
 def test_fstring_format_specs():
     src = "x = 3.14159\nprint(f'{x:.2f}')\n"
     rust = transpile_source(src)
-    assert 'format!("{:.2}", x)' in rust
+    assert 'py_format(&x, ".2f")' in rust
 
     src2 = "n = 42\nprint(f'{n:05d}')\n"
     rust2 = transpile_source(src2)
-    assert 'format!("{:05}", n)' in rust2
+    assert 'py_format(&n, "05d")' in rust2
 
-    with pytest.raises(PyRustError, match="format spec"):
-        transpile_source("x = 1.5\nprint(f'{x:.2%}')\n")
+    # The full format-spec mini-language is supported (checked against CPython
+    # by the differential suite); nested specs are not.
+    assert 'py_format(&x, ".2%")' in transpile_source("x = 1.5\nprint(f'{x:.2%}')\n")
+    with pytest.raises(PyRustError, match="nested"):
+        transpile_source("x = 1.5\nw = 5\nprint(f'{x:{w}}')\n")
 
 
 def test_file_io_open_read_write_and_with():
@@ -433,7 +436,7 @@ def test_str_format_and_percent_formatting():
 
     src2 = 'name = "bob"\nage = 30\ns2 = "hi %s, you are %d" % (name, age)\nprint(s2)\n'
     rust2 = transpile_source(src2)
-    assert 'let s2: String = format!("hi {}, you are {}", name, age);' in rust2
+    assert 'let s2: String = format!("hi {}, you are {}", py_str(&name), py_format(&age, "d"));' in rust2
 
     src3 = 's = "{name}".format(name="x")\n'
     assert 'format!("{}", "x".to_string())' in transpile_source(src3)
@@ -445,15 +448,15 @@ def test_str_format_and_percent_formatting():
 def test_print_sep_end_and_float_display():
     src = 'print(1, 2, 3, sep=",")\n'
     rust = transpile_source(src)
-    assert '.join(&",".to_string())' in rust
-    assert "println!" in rust
+    assert '.join(",")' in rust
+    assert "py_write_str(" in rust
 
     src2 = 'print("x", end="")\n'
     rust2 = transpile_source(src2)
-    assert 'print!("{}"' in rust2 and "println!" not in rust2
+    assert 'py_write_str(&format!("{}{}", format!("{}", "x".to_string()), ""))' in rust2
 
     src3 = "print(4.0)\n"
-    assert 'println!("{}", py_float_str(4.0f64));' in transpile_source(src3)
+    assert 'py_println!("{}", py_float_repr(4.0f64));' in transpile_source(src3)
 
 
 def test_builtins_sweep_divmod_round_all_any():
@@ -464,11 +467,11 @@ def test_builtins_sweep_divmod_round_all_any():
     assert ".iter().copied().all(|v| v)" in transpile_source("print(all([True, True]))\n")
     assert ".iter().copied().any(|v| v)" in transpile_source("print(any([False, True]))\n")
     assert ".rev()" in transpile_source("print(list(reversed([1, 2])))\n")
-    assert 'format!("{:#x}", 255)' in transpile_source("print(hex(255))\n")
-    assert 'format!("{:#o}", 8)' in transpile_source("print(oct(8))\n")
-    assert 'format!("{:#b}", 5)' in transpile_source("print(bin(5))\n")
-    assert 'chars().next().expect("ord() of empty string")' in transpile_source("print(ord('a'))\n")
-    assert "std::char::from_u32((65) as u32)" in transpile_source("print(chr(65))\n")
+    assert 'py_hex(255)' in transpile_source("print(hex(255))\n")
+    assert 'py_oct(8)' in transpile_source("print(oct(8))\n")
+    assert 'py_bin(5)' in transpile_source("print(bin(5))\n")
+    assert 'py_ord(&"a".to_string())' in transpile_source("print(ord('a'))\n")
+    assert "py_chr(65)" in transpile_source("print(chr(65))\n")
     assert "(i as i64 + 1, v)" in transpile_source("print(list(enumerate(['a'], 1)))\n")
 
 
@@ -485,21 +488,22 @@ def test_json_dumps_and_loads():
 
 
 def test_min_max_float_uses_partial_cmp():
-    assert "partial_cmp" in transpile_source("print(min([1.5, 0.5]))\n")
+    assert "py_min_of" in transpile_source("print(min([1.5, 0.5]))\n")
 
 
 def test_methods_sweep_list_dict_str():
-    assert ".remove(" in transpile_source('d = {"a": 1}\nd.pop("a")\n')
-    assert ".remove(" in transpile_source("xs = [1, 2, 3]\nxs.pop(0)\n")
+    assert ".pop_key(" in transpile_source('d = {"a": 1}\nd.pop("a")\n')
+    assert "py_list_pop_at(" in transpile_source("xs = [1, 2, 3]\nxs.pop(0)\n")
     assert '.entry("k".to_string()).or_insert(5).clone();' in transpile_source(
         'd = {}\nd.setdefault("k", 5)\n'
     )
-    assert "lstrip" not in transpile_source('print("  x".lstrip())\n')
-    assert ".trim_start().to_string()" in transpile_source('print("  x".lstrip())\n')
-    assert ".trim_end().to_string()" in transpile_source('print("x  ".rstrip())\n')
-    assert ".chars().all(|c| c.is_ascii_digit())" in transpile_source('print("42".isdigit())\n')
-    assert ".find(" in transpile_source('print("abc".find("b"))\n')
-    assert ".strip_prefix(" in transpile_source('print("unhappy".removeprefix("un"))\n')
+    # String methods go through runtime helpers with CPython's semantics
+    # (Unicode whitespace/digits, character offsets, strip(chars)).
+    assert "py_lstrip(&\"  x\".to_string(), None)" in transpile_source('print("  x".lstrip())\n')
+    assert "py_rstrip(&\"x  \".to_string(), Some(&\" \".to_string()))" in transpile_source('print("x  ".rstrip(" "))\n')
+    assert "py_str_isdigit(" in transpile_source('print("42".isdigit())\n')
+    assert "py_str_find(" in transpile_source('print("abc".find("b"))\n')
+    assert "py_removeprefix(" in transpile_source('print("unhappy".removeprefix("un"))\n')
 
 
 def test_mixed_bool_int_containers_stay_dynamic():
@@ -510,11 +514,11 @@ def test_mixed_bool_int_containers_stay_dynamic():
 
 def test_tuple_print_uses_python_repr():
     rust = transpile_source('t = (1, "a")\nprint(t)\n')
-    assert 'format!("({}, {})", t.0, py_repr_str(&t.1))' in rust
+    assert 'py_str(&t)' in rust
 
 
 def test_split_no_arg_uses_whitespace_semantics():
-    assert "py_split_whitespace(&s)" in transpile_source('s = "a  b\\n"\nprint(s.split())\n')
+    assert "py_split_ws_max(&s, -1)" in transpile_source('s = "a  b\\n"\nprint(s.split())\n')
 
 
 def test_comparison_edge_cases():
@@ -547,10 +551,10 @@ def test_for_else_while_else_and_slice_assign():
 
 def test_numeric_edge_cases():
     assert "((true as i64) + 1)" in transpile_source("print(True + 1)\n")
-    assert "py_pow_f64(2.0, (-1 as f64))" in transpile_source("print(2 ** -1)\n")
-    assert "py_float_str(py_mod_f64(7.5f64, 3.0f64))" in transpile_source("print(7.5 % 3.0)\n")
+    assert "py_pow_f64(2.0, ((-1) as f64))" in transpile_source("print(2 ** -1)\n")
+    assert "py_float_repr(py_mod_f64(7.5f64, 3.0f64))" in transpile_source("print(7.5 % 3.0)\n")
     assert '(if true { "True" } else { "False" })' in transpile_source("print(True)\n")
-    assert "(vec![1, 2].iter().copied().sum::<i64>() + 10)" in transpile_source("print(sum([1, 2], 10))\n")
+    assert "(py_sum_ints(&vec![1, 2]) + 10)" in transpile_source("print(sum([1, 2], 10))\n")
 
 
 def test_dataclass_fields_generate_init():
@@ -570,9 +574,9 @@ def test_dataclass_fields_generate_init():
     assert "let q: Point = Point::new(1.0f64, 0.0f64);" in rust
 
     with pytest.raises(PyRustError, match="staticmethod"):
-        transpile_source("class A:\n    @staticmethod\n    def f(x):\n        return x\n")
+        transpile_source("class A:\n    @staticmethod\n    def f(x):\n        return x\na = A()\nprint(a.f(1))\n")
     with pytest.raises(PyRustError, match="super"):
-        transpile_source("class A:\n    def m(self):\n        return super().m()\n")
+        transpile_source("class A:\n    def m(self):\n        return super().m()\nA().m()\n")
 
 
 def test_single_inheritance_flattens_fields_and_methods():
@@ -610,17 +614,17 @@ def test_stdlib_sys_os_time_shims():
     src = "import sys\nprint(sys.argv[1:])\nsys.exit(0)\n"
     rust = transpile_source(src)
     assert "std::env::args().collect::<Vec<String>>()" in rust
-    assert "std::process::exit((0) as i32)" in rust
+    assert "py_exit(((0) as i64 & 0xff) as i32)" in rust
 
     src2 = 'import os\nprint(os.getenv("HOME"))\nos.makedirs("d", exist_ok=True)\n'
     rust2 = transpile_source(src2)
-    assert "std::env::var(" in rust2
-    assert "std::fs::create_dir_all(" in rust2
+    assert "py_os_getenv(" in rust2
+    assert "py_os_mkdir(" in rust2
 
     src3 = "import time\nt = time.time()\ntime.sleep(0.5)\n"
     rust3 = transpile_source(src3)
     assert "py_unix_time()" in rust3
-    assert "std::thread::sleep(std::time::Duration::from_secs_f64(" in rust3
+    assert "py_sleep(" in rust3
 
     with pytest.raises(PyRustError, match="os.path"):
         transpile_source('import os\nprint(os.path.join("a", "b"))\n')
@@ -655,9 +659,10 @@ def test_corpus_wordcount_transpiles(tmp_path):
         "    counts = {}\n"
         "    ranked = sorted(counts.items(), key=len)\n"
         "    return len(ranked)\n"
+        "print(top_words('x'))\n"
     )
     # sorted() with a key function is out of scope and must fail loudly
-    with pytest.raises(PyRustError, match="keyword"):
+    with pytest.raises(PyRustError, match="key="):
         transpile_source(wc)
 
     wc_ok = (
@@ -689,15 +694,17 @@ def test_stdlib_platform_shim():
 def test_stdlib_statistics_shim():
     src = "import statistics\nm = statistics.mean([1, 2, 3])\nprint(m)\n"
     rust = transpile_source(src)
-    assert "let m: f64 = py_mean(" in rust
+    assert "let m: PyValue = py_mean(" in rust
 
     src2 = "import statistics\nmed = statistics.median([3, 1, 2])\nprint(med)\n"
     rust2 = transpile_source(src2)
     assert "let med: PyValue = py_median(" in rust2
 
+    # CPython computes stdev with exact fractions; native code refuses it.
     src3 = "from statistics import stdev, mode\ns = stdev([1.5, 2.5])\nprint(s)\n"
-    rust3 = transpile_source(src3)
-    assert "py_stdev(" in rust3
+    with pytest.raises(PyRustError, match="stdev"):
+        transpile_source(src3)
+    assert "py_mean_floats(" in transpile_source("import statistics\nprint(statistics.mean([1.5, 2.5]))\n")
 
     with pytest.raises(PyRustError, match="statistics"):
         transpile_source("import statistics\nprint(statistics.geometric_mean([1, 2]))\n")
@@ -727,7 +734,7 @@ def test_mixed_containers_stay_dynamic_and_honest():
     assert "PyDict<String, PyValue>" in rust2
 
     rust3 = transpile_source('xs = [1, "a"]\nprint(sum(xs))\n')
-    assert "fold(PyValue::Int(0)" in rust3
+    assert "py_sum_values(&xs)" in rust3
 
     rust4 = transpile_source('d = {"a": 1}\nprint(d.get("zz"))\n')
     assert "unwrap_or(PyValue::None)" in rust4
@@ -763,13 +770,13 @@ def test_dict_subscript_assignment_uses_insert():
 def test_raise_maps_to_panic_and_del_subscript():
     src = 'flag = True\nif flag:\n    raise ValueError("nope")\n'
     rust = transpile_source(src)
-    assert 'panic!("ValueError: {}", "nope".to_string());' in rust
+    assert 'py_raise(format!("ValueError: {}", "nope".to_string()));' in rust
 
     src2 = 'd = {"a": 1}\ndel d["a"]\n'
-    assert 'let _ = d.remove(&"a".to_string());' in transpile_source(src2)
+    assert 'd.del_key(&"a".to_string());' in transpile_source(src2)
 
     src3 = "lst = [1, 2, 3]\ndel lst[0]\n"
-    assert "let _ = lst.remove((0) as usize);" in transpile_source(src3)
+    assert "py_list_del(&mut lst, 0);" in transpile_source(src3)
 
     with pytest.raises(PyRustError):
         transpile_source("x = 1\ndel x\n")
@@ -827,6 +834,6 @@ s_list = sorted(combined)
     assert "let flag: bool =" in rust
     assert "py_list_concat(" in rust
     assert "py_list_repeat(" in rust
-    assert "py_range(5, 0, -1)" in rust
-    assert "py_sorted(" in rust
+    assert "py_range_iter(5, 0, (-1))" in rust
+    assert "py_sort(&mut __v)" in rust
 
