@@ -1,0 +1,19 @@
+def fib_recursive(n):
+    if n <= 1:
+        return n
+    return fib_recursive(n - 1) + fib_recursive(n - 2)
+
+
+def heavy_loop(n):
+    total = 0
+    for i in range(n):
+        total += (i * 37 + 11) % 1009
+        total = total % 1000000007
+    return total
+
+
+if __name__ == "__main__":
+    r = fib_recursive(32)
+    print(r)
+    h = heavy_loop(10000000)
+    print(h)

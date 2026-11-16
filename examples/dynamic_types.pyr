@@ -1,0 +1,17 @@
+# Demonstrates automatic PyValue fallback when variables dynamically switch types
+def describe_mode(flag):
+    if flag:
+        status = 200
+    else:
+        status = 404
+    return status
+
+
+# `dynamic_var` starts as an integer and switches to a string at runtime
+dynamic_var = 42
+print(dynamic_var)
+dynamic_var = "Now I am a string in Rust!"
+print(dynamic_var)
+
+code = describe_mode(True)
+print(f"Status code: {code}")

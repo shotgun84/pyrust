@@ -1,0 +1,24 @@
+# A normal Python script: uses the standard library, a generator expression and
+# try/except, so it cannot be compiled as a whole. PyRust still compiles the
+# hot function and runs everything else on CPython.
+import collections
+import re
+
+
+def collatz_steps(n: int):
+    steps = 0
+    while n != 1:
+        n = n // 2 if n % 2 == 0 else 3 * n + 1
+        steps += 1
+    return steps
+
+
+lengths = collections.Counter(collatz_steps(i) for i in range(1, 500_000))
+(steps, count), = lengths.most_common(1)
+print(f"most common chain length: {steps} steps ({count} numbers)")
+
+try:
+    longest = max(lengths)
+except ValueError:
+    longest = 0
+print(re.sub(r"\d+", str(longest), "longest chain: 0 steps"))

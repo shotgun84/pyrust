@@ -1,0 +1,20 @@
+def count_even_odd(n):
+    evens = 0
+    odds = 0
+    even_sum = 0
+    odd_sum = 0
+    for i in range(n):
+        if i % 2 == 0:
+            evens += 1
+            even_sum += i
+        else:
+            odds += 1
+            odd_sum += i
+    return evens, odds, even_sum, odd_sum
+
+
+if __name__ == "__main__":
+    e1, o1, es1, os1 = count_even_odd(7000000)
+    print(f"n=7000000 evens={e1} odds={o1} even_sum={es1} odd_sum={os1}")
+    e2, o2, es2, os2 = count_even_odd(34500000)
+    print(f"n=34500000 evens={e2} odds={o2} even_sum={es2} odd_sum={os2}")

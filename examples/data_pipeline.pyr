@@ -1,0 +1,20 @@
+# Untyped PyRust class, list comprehension, and dictionary pipeline
+class SensorReading:
+    def __init__(self, sensor_id, value):
+        self.sensor_id = sensor_id
+        self.value = value
+
+    def calibrate(self, offset, scale):
+        self.value = (self.value + offset) * scale
+        return self.value
+
+
+raw_values = [12, -4, 25, 0, 19, 31]
+positive_squares = [x * x for x in raw_values if x > 0]
+last_square = positive_squares[-1]
+
+sensor = SensorReading("thermo_01", 21.5)
+adjusted = sensor.calibrate(0.5, 1.8)
+
+counts = {"valid": len(positive_squares), "last": last_square}
+print(f"Adjusted sensor={adjusted}, valid={counts['valid']}, last={counts['last']}")

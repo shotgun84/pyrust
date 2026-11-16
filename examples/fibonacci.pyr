@@ -1,0 +1,22 @@
+# Untyped PyRust recursive & iterative Fibonacci benchmark
+def fib_recursive(n):
+    if n <= 1:
+        return n
+    return fib_recursive(n - 1) + fib_recursive(n - 2)
+
+
+def fib_iterative(n):
+    a = 0
+    b = 1
+    for i in range(n):
+        temp = a + b
+        a = b
+        b = temp
+    return a
+
+
+if __name__ == "__main__":
+    r20 = fib_recursive(20)
+    i50 = fib_iterative(50)
+    print(f"fib_recursive(20) = {r20}")
+    print(f"fib_iterative(50) = {i50}")

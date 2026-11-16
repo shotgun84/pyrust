@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 292" width="880" height="292" role="img" aria-label="pyrust run picks one of three tiers: native, hybrid, or plain Python. Output is identical in all three.">
+<title>pyrust run picks one of three tiers: native, hybrid, or plain Python. Output is identical in all three.</title>
+<rect x="348.0" y="6" width="184" height="34" rx="17" fill="#ffffff" stroke="#d9d8d2"/>
+<text x="440.0" y="28" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="600" fill="#0b0b0b">pyrust run app.pyr</text>
+<path d="M440.0,40 C440.0,56 146.0,48 146.0,66" fill="none" stroke="#d9d8d2" stroke-width="1.5"/>
+<rect x="10.0" y="66" width="272" height="214" rx="12" fill="#f6f5f2" stroke="#d9d8d2"/>
+<rect x="30.0" y="86" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="48.0" y="96" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="700" letter-spacing="1.5" fill="#0b0b0b">NATIVE</text>
+<text x="30.0" y="122" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8a8983">when the program fits the native subset</text>
+<text x="30.0" y="158" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#0b0b0b">Entire program becomes</text>
+<text x="30.0" y="180" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#0b0b0b">one Rust binary.</text>
+<rect x="30.0" y="218" width="232" height="6" rx="3" fill="#d9d8d2"/>
+<rect x="30.0" y="218" width="232.0" height="6" rx="3" fill="#eb6834"/>
+<text x="30.0" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#52514e">tens of times faster</text>
+<path d="M440.0,40 C440.0,56 440.0,48 440.0,66" fill="none" stroke="#d9d8d2" stroke-width="1.5"/>
+<rect x="304.0" y="66" width="272" height="214" rx="12" fill="#f6f5f2" stroke="#d9d8d2"/>
+<rect x="324.0" y="86" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="342.0" y="96" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="700" letter-spacing="1.5" fill="#0b0b0b">HYBRID</text>
+<text x="324.0" y="122" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8a8983">when it uses any library or any syntax</text>
+<text x="324.0" y="158" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#0b0b0b">Hot functions become native.</text>
+<text x="324.0" y="180" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#0b0b0b">The rest runs on CPython.</text>
+<rect x="324.0" y="218" width="232" height="6" rx="3" fill="#d9d8d2"/>
+<rect x="324.0" y="218" width="143.8" height="6" rx="3" fill="#2a78d6"/>
+<text x="324.0" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#52514e">hot paths 40-80x faster</text>
+<path d="M440.0,40 C440.0,56 734.0,48 734.0,66" fill="none" stroke="#d9d8d2" stroke-width="1.5"/>
+<rect x="598.0" y="66" width="272" height="214" rx="12" fill="#f6f5f2" stroke="#d9d8d2"/>
+<rect x="618.0" y="86" width="10" height="10" rx="2" fill="#b9b8b2"/>
+<text x="636.0" y="96" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="700" letter-spacing="1.5" fill="#0b0b0b">PYTHON</text>
+<text x="618.0" y="122" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8a8983">when there is nothing to compile</text>
+<text x="618.0" y="158" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#0b0b0b">Runs on CPython,</text>
+<text x="618.0" y="180" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#0b0b0b">exactly as before.</text>
+<rect x="618.0" y="218" width="232" height="6" rx="3" fill="#d9d8d2"/>
+<rect x="618.0" y="218" width="27.8" height="6" rx="3" fill="#b9b8b2"/>
+<text x="618.0" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#52514e">unchanged, ~30 ms launch cost</text>
+</svg>

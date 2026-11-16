@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 250" width="880" height="250" role="img" aria-label="PyRust: rename script.py to script.pyr. Add one letter, keep your Python.">
+<title>PyRust: rename script.py to script.pyr. Add one letter, keep your Python.</title>
+<style>
+  .cur { animation: blink 1.15s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0.25; } }
+  @media (prefers-reduced-motion: reduce) { .cur { animation: none; } }
+</style>
+<text x="623.2" y="118" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="78" font-weight="700" fill="#f0efec" xml:space="preserve"><tspan fill="#8a8983">script</tspan><tspan fill="#8a8983">.</tspan><tspan fill="#3987e5">py</tspan></text>
+<rect class="cur" x="629.2" y="55.6" width="42.8" height="79.6" rx="6" fill="#d95926"/>
+<text x="650.6" y="118" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="78" font-weight="700" fill="#ffffff">r</text>
+<text x="440" y="174" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="24" font-weight="600" fill="#f0efec">Add one letter. Keep your Python.</text>
+<text x="440" y="206" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="17" fill="#c3c2b7">Native speed where your code allows it. Plain Python everywhere else.</text>
+</svg>

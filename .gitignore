@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+dist/
+/build/
+
+# PyRust build caches (generated Rust crates, native libraries, launch plans)
+.pyrust_cache/
+
+# Rust
+target/
+Cargo.lock
+
+# Files written by the examples and benchmarks
+bench_log.txt
+report.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
