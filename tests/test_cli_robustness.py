@@ -205,6 +205,33 @@ def test_single_entry_file_compiles_sibling_modules_and_tracks_their_edits(tmp_p
     assert res.stdout == "28\n", res.stderr
 
 
+# ------------------------------------------------------------ A3 module reset
+
+
+@pytest.mark.parametrize("name", ["json", "hashlib", "inspect"])
+def test_cold_and_warm_cpython_runs_import_the_same_local_module(tmp_path: Path, name: str):
+    (tmp_path / f"{name}.py").write_text("WHO = 'local'\n", encoding="utf-8")
+    (tmp_path / "prog.py").write_text(f"{PYTHON_TIER}import {name}\nprint({name}.WHO)\n", encoding="utf-8")
+    expected = python("prog.py", cwd=tmp_path)
+    assert expected.stdout == "local\n"
+    for label in ("cold", "warm"):
+        res = pyrust("run", "prog.py", cwd=tmp_path)
+        assert res.stdout == expected.stdout, f"{label}: {res.stderr}"
+        assert res.returncode == 0
+
+
+def test_cpython_tier_starts_with_python_module_set(tmp_path: Path):
+    probe = (
+        f"{PYTHON_TIER}import sys\n"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in "
+        "{'pyrust', 'ast', 'dataclasses', 'subprocess', 'shutil', 'hashlib', 'json', 'marshal', 'runpy'}))\n"
+    )
+    (tmp_path / "prog.py").write_text(probe, encoding="utf-8")
+    expected = python("prog.py", cwd=tmp_path).stdout
+    for _ in range(2):
+        assert pyrust("run", "-q", "prog.py", cwd=tmp_path).stdout == expected
+
+
 # ---------------------------------------------------- A5 import-time code
 
 
@@ -379,6 +406,48 @@ def test_environment_build_failure_is_not_cached(tmp_path: Path):
     assert tier(res.stderr) == "native", res.stderr
 
 
+# ------------------------------------------- C1 check / build error reporting
+
+
+@needs_cargo
+@posix_only
+def test_genuine_compile_error_is_cached_and_reported(tmp_path: Path):
+    message = (
+        "warning: unused variable\n --> src/pyrust_rt.rs:1:1\n"
+        "error[E0308]: mismatched types\n --> src/main.rs:3:5\n  |\n"
+        "error: could not compile `p` (bin \"p\") due to 1 previous error\n"
+    )
+    env, flag = _fake_cargo(tmp_path, message)
+    (tmp_path / "p.py").write_text(NATIVE_OK, encoding="utf-8")
+    check = pyrust("check", "p.py", cwd=tmp_path, env=env)
+    assert "NATIVE (not yet compiled)" in check.stdout
+    res = pyrust("run", "p.py", cwd=tmp_path, env=env)
+    assert res.stdout == "144\n"
+    assert "Cargo build failed: error[E0308]: mismatched types" in res.stderr
+    flag.unlink()
+    res = pyrust("run", "p.py", cwd=tmp_path, env=env)
+    assert tier(res.stderr) == "python"  # same source, same toolchain: not retried
+    check = pyrust("check", "p.py", cwd=tmp_path, env=env)
+    assert "blocked: Cargo build failed: error[E0308]" in check.stdout
+    assert "NATIVE" not in check.stdout
+
+
+@needs_cargo
+def test_check_reports_compiled_state(tmp_path: Path):
+    (tmp_path / "p.py").write_text(NATIVE_OK, encoding="utf-8")
+    assert "NATIVE (not yet compiled)" in pyrust("check", "p.py", cwd=tmp_path).stdout
+    pyrust("run", "p.py", cwd=tmp_path)
+    out = pyrust("check", "p.py", cwd=tmp_path).stdout
+    assert "Tier: NATIVE - the whole program compiles" in out
+
+
+def test_generated_crates_silence_rust_warnings(tmp_path: Path):
+    (tmp_path / "p.py").write_text(NATIVE_OK, encoding="utf-8")
+    res = pyrust("transpile", "p.py", "-o", str(tmp_path / "crate"), cwd=tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert (tmp_path / "crate" / "src" / "main.rs").read_text(encoding="utf-8").startswith("#![allow(warnings)]")
+
+
 # ------------------------------------------------------ B6 unrelated files
 
 
@@ -405,6 +474,75 @@ def test_fallback_runs_entry_even_if_a_reachable_module_is_broken(tmp_path: Path
     assert res.stdout == expected.stdout
     assert res.returncode == expected.returncode
     assert res.stderr.strip().splitlines()[-1] == expected.stderr.strip().splitlines()[-1]
+
+
+# --------------------------------------------- B7 / C3 / C5 launching & signals
+
+SLEEPER = "import sys, time\nprint('ready')\nif len(sys.argv) > 1:\n    time.sleep(30)\nprint('done')\n"
+
+
+def _wait_ready(proc: subprocess.Popen, timeout: float = 300) -> None:
+    deadline = time.time() + timeout
+    line = b""
+    while time.time() < deadline:
+        ready, _, _ = select.select([proc.stdout], [], [], 1)
+        if ready:
+            line = proc.stdout.readline()
+            break
+    assert line.strip() == b"ready", line
+
+
+@needs_cargo
+@posix_only
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_signals_reach_the_native_program(tmp_path: Path, signum: int):
+    (tmp_path / "s.py").write_text(SLEEPER, encoding="utf-8")
+    first = pyrust("run", "s.py", cwd=tmp_path)  # build first
+    assert first.stdout == "ready\ndone\n" and tier(first.stderr) == "native", first.stderr
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pyrust.cli", "run", "s.py", "sleep"],
+        cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_env(),
+    )
+    _wait_ready(proc)
+    proc.send_signal(signum)
+    proc.wait(timeout=10)
+    assert proc.returncode == -signum
+    # No orphan keeps the output pipe open.
+    ready, _, _ = select.select([proc.stdout], [], [], 5)
+    assert ready and proc.stdout.read() == b""
+    assert b"Traceback" not in proc.stderr.read()
+
+
+@posix_only
+def test_keyboard_interrupt_on_cpython_tier_dies_by_sigint(tmp_path: Path):
+    (tmp_path / "k.py").write_text(f"{PYTHON_TIER}raise KeyboardInterrupt\n", encoding="utf-8")
+    expected = python("k.py", cwd=tmp_path)
+    assert expected.returncode == -signal.SIGINT
+    res = pyrust("run", "k.py", cwd=tmp_path)
+    assert res.returncode == expected.returncode
+    assert res.stderr.strip().splitlines()[-1] == "KeyboardInterrupt"
+
+
+@needs_cargo
+@posix_only
+def test_native_crash_status_is_not_truncated(tmp_path: Path):
+    (tmp_path / "deep.py").write_text(
+        "def f(n):\n    return f(n + 1) + 1\nprint(f(0))\n", encoding="utf-8"
+    )
+    res = pyrust("run", "deep.py", cwd=tmp_path)
+    if tier(res.stderr) != "native":
+        pytest.skip("program did not compile natively")
+    assert res.returncode < 0  # died by a signal, like the binary itself (not 250 / 245)
+
+
+@pytest.mark.parametrize("prefix", ["", PYTHON_TIER])
+def test_sys_argv0_is_the_script_as_typed(tmp_path: Path, prefix: str):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.py").write_text(f"{prefix}import sys\nprint(sys.argv[0])\n", encoding="utf-8")
+    expected = python("sub/a.py", "x", cwd=tmp_path).stdout
+    assert expected == "sub/a.py\n"
+    for _ in range(2):
+        assert pyrust("run", "sub/a.py", "x", cwd=tmp_path).stdout == expected
 
 
 # ------------------------------------------------------------- C4 __main__
@@ -476,6 +614,20 @@ def test_pruning_spares_other_programs_with_the_same_stem(tmp_path: Path):
     t0 = time.time()
     assert pyrust("run", "twin.py", cwd=tmp_path).stdout == "144\n"
     assert time.time() - t0 < 3  # still cached: not rebuilt
+
+
+# --------------------------------------------------------- C8 note length
+
+
+def test_hybrid_note_truncates_long_name_lists(capsys, monkeypatch):
+    from pyrust.cli import describe_fallback
+
+    monkeypatch.delenv("PYRUST_QUIET", raising=False)
+    names = [f"function_{i}" for i in range(5000)]
+    describe_fallback({"tier": "hybrid", "names": names, "blocker": "x"})
+    err = capsys.readouterr().err
+    note = [ln for ln in err.splitlines() if ln.startswith("[pyrust] running on CPython + 5000 native function(s): ")]
+    assert note and len(note[0]) < 300
 
 
 # ---------------------------------------------------- C10 -o safety
@@ -553,3 +705,59 @@ def test_read_only_folder_uses_the_user_cache(tmp_path: Path):
         assert not (ro / ".pyrust_cache").exists()
     finally:
         ro.chmod(0o755)
+
+
+# ------------------------------------------------------------- D cosmetics
+
+
+def test_cargo_missing_message_fits_the_platform(tmp_path: Path):
+    (tmp_path / "p.py").write_text(NATIVE_OK, encoding="utf-8")
+    res = pyrust("build", "p.py", cwd=tmp_path, env=no_cargo_env(tmp_path))
+    assert res.returncode == 1
+    assert ("winget" in res.stderr) == (os.name == "nt")
+    assert "rustup.rs" in res.stderr
+    assert "PyRustError" not in res.stderr
+
+
+def test_build_errors_have_no_internal_prefix_or_run_wording(tmp_path: Path):
+    (tmp_path / "h.py").write_text("import collections\nprint(1)\n", encoding="utf-8")
+    res = pyrust("build", "h.py", cwd=tmp_path)
+    assert res.returncode == 1
+    assert "PyRustError" not in res.stderr
+    assert "so it runs on CPython" not in res.stderr
+    assert "collections" in res.stderr
+
+
+def test_check_fails_on_syntax_errors(tmp_path: Path):
+    (tmp_path / "s.py").write_text("def f(:\n", encoding="utf-8")
+    res = pyrust("check", "s.py", cwd=tmp_path)
+    assert res.returncode != 0
+    assert "Syntax error" in res.stderr
+
+
+@posix_only
+def test_check_into_closed_pipe_has_no_traceback(tmp_path: Path):
+    (tmp_path / "p.py").write_text(f"{PYTHON_TIER}" + NATIVE_OK, encoding="utf-8")
+    r, w = os.pipe()
+    os.close(r)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pyrust.cli", "check", "p.py"],
+        cwd=tmp_path, stdout=w, stderr=subprocess.PIPE, env=_env(), timeout=120,
+    )
+    os.close(w)
+    assert b"Traceback" not in proc.stderr
+    assert proc.returncode != 0
+
+
+def test_unicode_script_names_keep_their_letters(tmp_path: Path):
+    (tmp_path / "café.py").write_text(NATIVE_OK, encoding="utf-8")
+    res = pyrust("transpile", "café.py", "-o", str(tmp_path / "c"), cwd=tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert 'name = "café"' in (tmp_path / "c" / "Cargo.toml").read_text(encoding="utf-8")
+
+
+def test_transpile_stdout_leaves_no_cache_behind(tmp_path: Path):
+    (tmp_path / "p.py").write_text(NATIVE_OK, encoding="utf-8")
+    res = pyrust("transpile", "p.py", "--stdout", cwd=tmp_path)
+    assert res.returncode == 0 and "fn main()" in res.stdout
+    assert not (tmp_path / ".pyrust_cache").exists()
