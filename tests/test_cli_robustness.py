@@ -136,3 +136,41 @@ def test_migrate_missing_directory_is_an_error(tmp_path: Path):
     assert "Traceback" not in res.stderr
 
 
+# ------------------------------------------------------ D plan cache format
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"tier": "native", "binary": None},
+        {"tier": "native"},
+        {"tier": "hybrid", "script": 5},
+        {"tier": "python", "script": None},
+        {"tier": "python", "script": "x", "names": 3},
+        ["not", "a", "dict"],
+    ],
+)
+def test_malformed_plan_is_discarded(tmp_path: Path, bad):
+    import marshal
+
+    (tmp_path / "p.py").write_text(f"{PYTHON_TIER}print('fine')\n", encoding="utf-8")
+    env = _env()
+    first = pyrust("run", "p.py", cwd=tmp_path, env=env)
+    assert first.stdout == "fine\n"
+    plans = list((tmp_path / ".pyrust_cache").glob("plan_*.bin"))
+    assert len(plans) == 1
+    plans[0].write_bytes(marshal.dumps(bad))
+    res = pyrust("run", "p.py", cwd=tmp_path, env=env)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == "fine\n"
+
+
+def test_toolchain_identity_is_part_of_the_cache_key(tmp_path: Path):
+    code = "from pyrust.plancache import toolchain_salt; print(toolchain_salt())"
+    with_cargo = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=_env())
+    without = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=no_cargo_env(tmp_path)
+    )
+    assert with_cargo.returncode == without.returncode == 0
+    if HAS_CARGO:
+        assert with_cargo.stdout != without.stdout
