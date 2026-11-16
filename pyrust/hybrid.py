@@ -465,6 +465,8 @@ def _dependencies(
             const_values[c] = ["int", value]
     return {
         "funcs": sorted(funcs),
+        # native callers bake in these functions' default values
+        "defaults": sorted(f for f in funcs if candidates[f].args.defaults),
         "consts": const_values,
         "math": sorted(math_attrs) if uses_math else None,
         "builtins": sorted(builtins_used),

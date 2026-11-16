@@ -90,7 +90,7 @@ def test_except_as_and_match_captures_are_bindings():
 def test_dependencies_are_transitive():
     src = (
         "import math\nLIMIT = 5\nHALF = 0.5\n"
-        "def step(x):\n    return x + LIMIT\n"
+        "def step(x, k=1):\n    return x + LIMIT * k\n"
         "def run(n):\n    t = 0\n    for i in range(n):\n        t = step(t)\n    return t\n"
         "def outer(n):\n    t = 0.0\n    for i in range(n):\n        t += run(2) * HALF + math.sqrt(abs(i))\n    return t\n"
         "def rec(n):\n    return 0 if n <= 0 else 1 + rec(n - 1)\n"
@@ -98,9 +98,12 @@ def test_dependencies_are_transitive():
     )
     plan = plan_hybrid(src, "x.py")
     deps = {f.name: f.deps for f in plan.functions}
-    assert deps["run"] == {"funcs": ["step"], "consts": {"LIMIT": ["int", 5]}, "math": None, "builtins": ["range"]}
+    assert deps["run"] == {
+        "funcs": ["step"], "defaults": ["step"], "consts": {"LIMIT": ["int", 5]}, "math": None, "builtins": ["range"]
+    }
     assert deps["outer"] == {
         "funcs": ["run", "step"],
+        "defaults": ["step"],
         "consts": {"HALF": ["float", (0.5).hex()], "LIMIT": ["int", 5]},
         "math": ["sqrt"],
         "builtins": ["abs", "range"],
@@ -381,6 +384,25 @@ def test_function_rebinding_its_own_name():
     assert f(10) == 3628800 and len(lib.calls) == 1
     ns["fact"] = lambda n: 0
     assert f(10) == 0 and len(lib.calls) == 1
+
+
+def test_mutating_a_native_callees_code_or_defaults_falls_back():
+    src = (
+        "def helper(x, k=2):\n    return x * k\n"
+        "def other(x, k=2):\n    return x + k\n"
+        "def run(n):\n    t = 0\n    for i in range(n):\n        t += helper(i)\n    return t\n"
+    )
+    deps = no_deps(funcs=["helper"], defaults=["helper"], builtins=["range"])
+    lib = FakeLib()
+    ns = accelerate(src, {"run": (deps, [(["int"], "int", lambda n: sum(i * 2 for i in range(n)))])}, lib)
+    run, helper = ns["run"], ns["helper"]
+    assert run(4) == 12 and len(lib.calls) == 1
+    helper.__defaults__ = (10,)
+    assert run(4) == 60 and len(lib.calls) == 1
+    helper.__defaults__ = tuple([2])  # a different tuple, even if equal: stay on Python
+    assert run(4) == 12 and len(lib.calls) == 1
+    helper.__code__ = ns["other"].__code__
+    assert run(4) == 14 and len(lib.calls) == 1
 
 
 def test_instrument_drops_the_accel_table_after_the_last_def():

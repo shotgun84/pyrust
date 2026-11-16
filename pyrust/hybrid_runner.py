@@ -89,8 +89,10 @@ class _Context:
         return c
 
     def register(self, name: str, fn):
-        """Record the function object a module global must hold for native callers to be valid."""
+        """Record the function object (and its code and defaults) native callers stand for."""
         self.cell("fn", name).cell_contents = fn
+        self.cell("code", name).cell_contents = getattr(fn, "__code__", _UNSET)
+        self.cell("defaults", name).cell_contents = getattr(fn, "__defaults__", _UNSET)
         return fn
 
     def refresher(self, g: dict, consts: dict):
@@ -240,9 +242,15 @@ def _wrap(orig, spec: dict, calls: list, ctx: _Context):
         cells[cell_name] = types.CellType(value)
 
     terms = []
+    with_defaults = set(deps.get("defaults", ()))
     for f in deps.get("funcs", ()):
-        terms.append(f"__pyr_g[{f!r}] is __pyr_f_{f}")
+        # still the same function, still running the same code (and defaults) the native call stands for
+        terms.append(f"__pyr_g[{f!r}] is __pyr_f_{f} and __pyr_f_{f}.__code__ is __pyr_fc_{f}")
         cells[f"__pyr_f_{f}"] = ctx.cell("fn", f)
+        cells[f"__pyr_fc_{f}"] = ctx.cell("code", f)
+        if f in with_defaults:
+            terms.append(f"__pyr_f_{f}.__defaults__ is __pyr_fd_{f}")
+            cells[f"__pyr_fd_{f}"] = ctx.cell("defaults", f)
     consts = deps.get("consts") or {}
     for k in consts:
         terms.append(f"__pyr_g[{k!r}] is __pyr_k_{k}")
