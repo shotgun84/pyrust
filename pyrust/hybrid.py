@@ -107,6 +107,8 @@ class HybridPlan:
     skipped: dict[str, str] = field(default_factory=dict)
     # Rust module per variant index (index 0 is `rust_source`); "" = unused.
     variant_sources: list[str] = field(default_factory=list)
+    # Python functions compiled into each of those modules.
+    compiled_names: list[list[str]] = field(default_factory=list)
     # Extra facts about accelerated functions (guessed signatures, dropped variants).
     notes: dict[str, str] = field(default_factory=dict)
 
@@ -874,6 +876,7 @@ def plan_hybrid(
     plan.functions = list(exported.values())
     plan.rust_source = compiled.rust if plan.functions else ""
     plan.variant_sources = [plan.rust_source]
+    plan.compiled_names = [list(candidates) if plan.functions else []]
 
     # Variants 1..: one more native signature per function whose call sites disagree.
     for index in range(1, MAX_SIGNATURES):
@@ -912,6 +915,7 @@ def plan_hybrid(
                 fn_plan.variants.append(Variant(sig[0], sig[1], index))
                 added = True
         plan.variant_sources.append(result.rust if (result is not None and added) else "")
+        plan.compiled_names.append(list(subset) if (result is not None and added) else [])
 
     plan.notes = {name: "; ".join(texts) for name, texts in notes.items() if name in exported}
     return plan
@@ -1143,7 +1147,8 @@ def _build_culprits(stderr: str, plan: HybridPlan) -> dict[tuple[int, str], str]
             continue
         index = 0 if path == "src/accel.rs" else int(path.rsplit("_v", 1)[1].split(".")[0])
         owner = [name for start, name in owners[path] if start <= lineno]
-        if owner:
+        known = plan.compiled_names[index] if index < len(plan.compiled_names) else []
+        if owner and owner[-1] in known:  # (not some Rust-only helper)
             found.setdefault((index, owner[-1]), msg)
     return found
 
@@ -1178,7 +1183,8 @@ def prepare_hybrid(script: Path, cargo_bin: str | None) -> tuple[dict | None, Hy
     """Plan + build (cached) the native library for `script`.
 
     Returns `(manifest, plan)`; manifest is None when nothing runs natively.
-    `plan` is None when the result came from the cache.
+    `plan` is None when a cached library is used (its manifest carries the
+    reasons); a cached "nothing native" result returns a plan with only them.
 
     If the Rust compiler rejects some function's generated code, that function
     (and whatever calls it natively) is dropped and the rest is rebuilt, at most
@@ -1200,7 +1206,10 @@ def prepare_hybrid(script: Path, cargo_bin: str | None) -> tuple[dict | None, Hy
             if manifest.get("version") == MANIFEST_VERSION and (
                 not manifest["functions"] or Path(manifest["dll"]).exists()
             ):
-                return (manifest if manifest["functions"] else None), None
+                if manifest["functions"]:
+                    return manifest, None
+                # Nothing runs natively: still hand back why, for `pyrust check`.
+                return None, HybridPlan(skipped=dict(manifest.get("skipped", {})))
         except (OSError, ValueError, KeyError):
             pass
 
@@ -1219,8 +1228,8 @@ def prepare_hybrid(script: Path, cargo_bin: str | None) -> tuple[dict | None, Hy
                 manifest["dll"] = str(dll)
                 manifest["functions"] = _manifest_functions(plan)
                 break
-            culprits = _build_culprits(proc.stderr, plan)
-            if not culprits or attempt == MAX_BUILDS - 1:
+            culprits = {k: v for k, v in _build_culprits(proc.stderr, plan).items() if k not in exclude}
+            if not culprits or attempt == MAX_BUILDS - 1:  # errors outside any function: give up
                 manifest["error"] = proc.stderr.strip()[-4000:]
                 for f in plan.functions:
                     plan.skipped[f.name] = "generated Rust failed to compile (PyRust bug); running on CPython"

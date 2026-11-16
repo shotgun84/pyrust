@@ -453,6 +453,24 @@ def test_one_function_failing_to_build_does_not_drop_the_others(tmp_path: Path, 
 
 
 @needs_cargo
+def test_reasons_survive_when_nothing_builds(tmp_path: Path, monkeypatch):
+    import pyrust.codegen as codegen
+
+    real = codegen.generate_rust_module
+    monkeypatch.setattr(codegen, "generate_rust_module", lambda *a, **k: real(*a, **k) + "\nfn broken() -> i64 { 1.5 }\n")
+    builds = []
+    real_run = hybrid.subprocess.run
+    monkeypatch.setattr(hybrid.subprocess, "run", lambda *a, **k: builds.append(a) or real_run(*a, **k))
+    script = tmp_path / "prog.py"
+    script.write_text(GOOD_AND_BAD, encoding="utf-8")
+    manifest, plan = prepare_hybrid(script, find_cargo_executable())
+    assert manifest is None and "failed to compile" in plan.skipped["good"]
+    assert len(builds) == 1  # the error is in no function: retrying cannot help
+    checked = plan_execution(script, build=False)  # from the cached manifest
+    assert checked.tier == "python" and "failed to compile" in checked.skipped["good"]
+
+
+@needs_cargo
 def test_multi_signature_build_runs_both_natively(tmp_path: Path):
     script = tmp_path / "prog.py"
     script.write_text(
